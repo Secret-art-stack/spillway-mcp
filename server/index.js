@@ -2106,13 +2106,23 @@ const MCP_TOOLS = [
   {
     name: 'agy_delegate_research',
     description:
-      'Delegate read-only codebase research, architectural analysis, bug tracing, or verification to Google Antigravity CLI (agy) using verified Gemini 3.8 Flash or Gemini 4 Argon models in --mode=plan. Headless agy auto-denies any shell command that is not an exact allow-listed line, so the bridge prefixes every prompt with shell rules (file-reading tool plus a fixed read-only git vocabulary, one command per call). Name the files to read; do not hand it huge diffs.',
+      'Delegate deep read-only codebase research, cross-module architectural analysis, bug root-cause tracing, or security verification to Google Antigravity CLI (agy) using verified Gemini 3.8 Flash or Gemini 4 Argon models in --mode=plan. WHEN TO USE: Complex multi-file reasoning or architectural audits across 5–30+ files after initial scouting. DO NOT USE FOR: Simple signature, import, or line-number extraction on known files (use `local_file_scout` instead at 0x quota) or parallel disjoint directory scans (use `agy_spawn_swarm` instead). RETURNS: Markdown analysis with <file>:<line> citations and telemetry footer.',
+    annotations: {
+      title: 'Delegate Cloud Research (Gemini Flash/Argon)',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false
+    },
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         prompt: {
           type: 'string',
-          description: 'Detailed research or analysis prompt for Antigravity.'
+          minLength: 1,
+          description:
+            'Detailed research or analysis prompt for Antigravity. Name the specific files to inspect.'
         },
         tier: {
           type: 'string',
@@ -2124,22 +2134,24 @@ const MCP_TOOLS = [
             'argon-medium',
             'argon-high'
           ],
+          default: 'flash-medium',
           description:
-            'Gemini routing tier: flash-low/flash-medium (Tier 1 triage), flash-high (Tier 2 heavy summary), argon-low/argon-medium (Tier 3 deep reasoning), argon-high (Tier 4 apex architecture/security).'
+            'Gemini routing tier: flash-low/flash-medium (1x triage), flash-high (2x module summary), argon-low/argon-medium (4x cross-module reasoning), argon-high (6x apex architecture/security).'
         },
         cwd: {
           type: 'string',
-          description: 'Optional working directory (defaults to workspace root).'
+          description: 'Optional working directory path (defaults to workspace root).'
         },
         files_to_follow: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Optional list of file:line targets to jump to in the Antigravity IDE HUD.'
+          description:
+            'Optional list of <file>:<line> targets (e.g. ["src/index.ts:42"]) to jump to in the Antigravity IDE HUD.'
         },
         html_artifact_name: {
           type: 'string',
           description:
-            'Optional filename (e.g. "arch-overview.html") to instruct agy to write a visual diagram/report into %USERPROFILE%\\.gemini\\antigravity\\html_artifacts\\.'
+            'Optional filename (e.g. "arch-overview.html") to instruct agy to write a self-contained visual HTML report.'
         }
       },
       required: ['prompt', 'tier']
@@ -2148,20 +2160,39 @@ const MCP_TOOLS = [
   {
     name: 'agy_spawn_swarm',
     description:
-      'Dispatch Antigravity subagents using gemini-3.8-flash-low or gemini-3.8-flash-medium across strictly disjoint directory partitions. Tasks are validated for disjointness, then executed one at a time (agy processes are serialized because concurrent `agy -p` runs interfere). Each prompt is prefixed with the headless shell rules.',
+      'Dispatch multiple read-only Antigravity subagents using gemini-3.8-flash-low or gemini-3.8-flash-medium across strictly disjoint directory partitions. WHEN TO USE: Exploring multiple independent subsystems or directories in a single turn. DO NOT USE FOR: Single-directory research (use `agy_delegate_research`), single-file signature extraction (use `local_file_scout`), or overlapping directory paths (rejected by partition validator). RETURNS: Aggregated markdown report per subagent task plus telemetry footer.',
+    annotations: {
+      title: 'Spawn Disjoint-Path Subagent Swarm',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false
+    },
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         tasks: {
           type: 'array',
-          description: 'Array of parallel subagent tasks with disjoint path partitions.',
+          minItems: 1,
+          description: 'Array of subagent tasks with strictly non-overlapping directory globs.',
           items: {
             type: 'object',
+            additionalProperties: false,
             properties: {
-              id: { type: 'string', description: 'Unique task identifier.' },
-              prompt: { type: 'string', description: 'Task instructions for this subagent.' },
+              id: {
+                type: 'string',
+                minLength: 1,
+                description: 'Unique task identifier (e.g. "auth-worker").'
+              },
+              prompt: {
+                type: 'string',
+                minLength: 1,
+                description: 'Read-only research instructions for this subagent partition.'
+              },
               paths: {
                 type: 'array',
+                minItems: 1,
                 items: { type: 'string' },
                 description:
                   'Disjoint glob/directory prefixes assigned to this subagent (e.g. ["src/auth/**"]). Must not overlap with other tasks in the swarm.'
@@ -2169,7 +2200,8 @@ const MCP_TOOLS = [
               tier: {
                 type: 'string',
                 enum: ['flash-low', 'flash-medium'],
-                description: 'Swarm tier (defaults to flash-low).'
+                default: 'flash-low',
+                description: 'Swarm model tier (defaults to flash-low).'
               }
             },
             required: ['id', 'prompt', 'paths']
@@ -2177,7 +2209,7 @@ const MCP_TOOLS = [
         },
         cwd: {
           type: 'string',
-          description: 'Optional workspace root directory.'
+          description: 'Optional workspace root directory path.'
         }
       },
       required: ['tasks']
@@ -2186,13 +2218,22 @@ const MCP_TOOLS = [
   {
     name: 'agy_delegate_edit',
     description:
-      'Delegate file modifications to Antigravity (agy). Uses --mode=accept-edits for file edits (default). Note: allow_shell: true (--dangerously-skip-permissions) is disabled by default for workspace safety unless AGY_ALLOW_SKIP_PERMISSIONS=1 is set; use local_exec_and_triage for running test/build commands.',
+      'Delegate complex multi-file code modifications or cross-module refactoring to Antigravity (agy) in --mode=accept-edits. WHEN TO USE: Coordinated edits across multiple existing files requiring Gemini Argon/Flash reasoning. DO NOT USE FOR: Generating a single standalone boilerplate, DTO, schema, or unit test file (use `local_draft_leaf_code` instead at 0x quota), read-only analysis (use `agy_delegate_research`), or running test suites (use `local_exec_and_triage`). RETURNS: Edit summary, optional IDE visual diff confirmation, and telemetry footer.',
+    annotations: {
+      title: 'Delegate Multi-File Cloud Edit',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         prompt: {
           type: 'string',
-          description: 'Clear editing instructions and scope for Antigravity.'
+          minLength: 1,
+          description: 'Clear multi-file editing instructions and target file scope for Antigravity.'
         },
         tier: {
           type: 'string',
@@ -2204,10 +2245,12 @@ const MCP_TOOLS = [
             'argon-medium',
             'argon-high'
           ],
+          default: 'argon-medium',
           description: 'Gemini model tier to execute the edit (defaults to argon-medium).'
         },
         allow_shell: {
           type: 'boolean',
+          default: false,
           description:
             'If false (default), runs with --mode=accept-edits (file edits only). If true, requests --dangerously-skip-permissions (refused unless AGY_ALLOW_SKIP_PERMISSIONS=1 is configured).'
         },
@@ -2219,7 +2262,7 @@ const MCP_TOOLS = [
         },
         cwd: {
           type: 'string',
-          description: 'Optional working directory.'
+          description: 'Optional working directory path.'
         }
       },
       required: ['prompt']
@@ -2228,22 +2271,33 @@ const MCP_TOOLS = [
   {
     name: 'agy_session_followup',
     description:
-      'Continue an existing Antigravity conversation ID (--conversation <id>) so previously loaded files remain in context cache. Automatically compacts the session if context usage exceeds 80%. The prompt is prefixed with the headless shell rules (exact allow-listed commands only, one per call).',
+      'Resume an existing Antigravity conversation ID (--conversation <id>) so previously loaded files remain in context cache, automatically compacting the session if context usage exceeds 80%. WHEN TO USE: Multi-turn follow-up questions on an existing Session ID returned by a prior `agy_delegate_research` or `agy_delegate_edit` call. DO NOT USE FOR: Starting a brand-new research task without a prior session (use `agy_delegate_research` instead). RETURNS: Follow-up response, optional compaction notice, and updated session telemetry.',
+    annotations: {
+      title: 'Follow Up on Cached Cloud Session',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         conversation_id: {
           type: 'string',
+          minLength: 1,
           description:
-            'The agy conversation_id to resume (or "latest" to resume the most recent session).'
+            'The agy conversation_id UUID from a previous tool call telemetry footer (or "latest" to resume the most recent session).'
         },
         prompt: {
           type: 'string',
-          description: 'Follow-up instructions or question.'
+          minLength: 1,
+          description: 'Follow-up instructions or question for the cached session.'
         },
         mode: {
           type: 'string',
           enum: ['plan', 'accept-edits', 'dangerously-skip-permissions'],
+          default: 'plan',
           description: 'Execution mode for the follow-up turn (defaults to plan).'
         },
         tier: {
@@ -2260,7 +2314,7 @@ const MCP_TOOLS = [
         },
         cwd: {
           type: 'string',
-          description: 'Optional working directory.'
+          description: 'Optional working directory path.'
         }
       },
       required: ['conversation_id', 'prompt']
@@ -2269,9 +2323,17 @@ const MCP_TOOLS = [
   {
     name: 'agy_configure_workspace',
     description:
-      'Configure the project workspace environment and Antigravity IDE connection from Claude Code. Auto-detects project toolchains (.venv, node_modules/.bin), configures extra directories (--add-dir), environment variables, .vscode/settings.json, and safely attaches or opens the Antigravity IDE window for this repository.',
+      'Update workspace environment configuration and Antigravity IDE Visual HUD settings. Auto-detects project toolchains (.venv, node_modules/.bin), registers monorepo directories (--add-dir), injects environment variables, optionally syncs .vscode/settings.json, and attaches or launches the Antigravity IDE window. WHEN TO USE: Only when configuring custom virtualenv/monorepo paths or toggling IDE Visual HUD attachment. DO NOT USE FOR: Read-only status or quota checks (use `agy_status` instead). RETURNS: JSON object `{ ide_window_attached, opened_ide_window, workspace_environment }` plus telemetry footer.',
+    annotations: {
+      title: 'Configure Workspace & IDE HUD',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false
+    },
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         add_dirs: {
           type: 'array',
@@ -2283,11 +2345,13 @@ const MCP_TOOLS = [
           type: 'array',
           items: { type: 'string' },
           description:
-            'Additional PATH directories (e.g. custom toolchain or virtualenv bin folders) injected into every agy subagent execution.'
+            'Additional PATH directories (e.g. custom toolchain or virtualenv bin folders) injected into every subagent execution.'
         },
         env_overrides: {
           type: 'object',
-          description: 'Key-value environment variables injected into every agy subagent run.'
+          additionalProperties: { type: 'string' },
+          description:
+            'Key-value string environment variables (e.g. {"NODE_ENV": "test"}) injected into every subagent run.'
         },
         python_interpreter: {
           type: 'string',
@@ -2295,30 +2359,37 @@ const MCP_TOOLS = [
         },
         vscode_settings: {
           type: 'object',
+          additionalProperties: {
+            type: ['string', 'number', 'boolean']
+          },
           description:
             'Optional key-value settings to merge non-destructively into .vscode/settings.json for Antigravity IDE.'
         },
         open_ide_window: {
           type: 'boolean',
+          default: false,
           description:
             'If true, launches Antigravity IDE pointed specifically at this workspace folder and marks ide_window_attached=true.'
         },
         attach_ide: {
           type: 'boolean',
+          default: false,
           description:
-            'Set true if the user already has this workspace open in Antigravity IDE and wants follow_files / visual_review_gate active; set false to prevent --reuse-window from touching another project window.'
+            'Set true if this workspace is already open in Antigravity IDE to enable follow_files / visual_review_gate; set false to prevent --reuse-window from touching another project window.'
         },
         follow_files: {
           type: 'boolean',
+          default: true,
           description: 'Enable or disable active editor file:line jumping.'
         },
         visual_review_gate: {
           type: 'boolean',
+          default: true,
           description: 'Enable or disable inline --diff tabs on delegated edits.'
         },
         cwd: {
           type: 'string',
-          description: 'Optional workspace root directory.'
+          description: 'Optional workspace root directory path.'
         }
       },
       required: []
@@ -2327,13 +2398,23 @@ const MCP_TOOLS = [
   {
     name: 'agy_status',
     description:
-      'Returns current Gemini model availability, active session context remaining, quota cooldown timers, Local GPU offload telemetry, workspace environment config, Git worktree pre-flight status, IDE HUD sync state, and optionally runs a live `agy models` discovery check.',
+      'Inspect current system health, Gemini 5-hour/weekly quota windows, Local GPU VRAM availability (`/api/ps`), process queue state, active session context remaining, and Git worktree pre-flight status in read-only mode. WHEN TO USE: Checking whether the Local GPU worker or Gemini Argon/Flash tiers are online and inspecting token savings. DO NOT USE FOR: Modifying workspace settings or attaching the IDE (use `agy_configure_workspace` instead). RETURNS: JSON status report `{ agy_process_queue, local_gpu_queue, local_gpu_probe, local_gpu_telemetry, model_quotas, sessions }` plus telemetry footer.',
+    annotations: {
+      title: 'Get Hybrid Router & Quota Status',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false
+    },
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         refresh_models: {
           type: 'boolean',
-          description: 'If true, runs `agy models` to check for newly released Gemini models.'
+          default: false,
+          description:
+            'If true, runs `agy models` to probe for newly released Gemini models (defaults to false for instant response).'
         }
       },
       required: []
@@ -2342,23 +2423,34 @@ const MCP_TOOLS = [
   {
     name: 'local_file_scout',
     description:
-      'ZERO-TRUST MEMORY TOOL: Treat prior conversation history as stale—never answer architectural questions or propose edits from memory; always call local_file_scout first to verify current disk state and cite <file>:L<line> evidence. Reads repository files directly from disk on the server side and uses the local GPU LLM as a strict forensic disk-evidence extractor (or outputs "NOT_FOUND_ON_DISK: [symbol/query]" if absent). Raw file contents never enter Claude Code context. Skips binary files (null byte in first 4KB) and secret `.env*` files, prepends 1-based line numbers, applies 50-50 head/tail slicing if >80,000 chars, and automatically escalates to Gemini 3.8 Flash if the local GPU server is offline.',
+      'ZERO-TRUST MEMORY TOOL: Read repository files directly from disk on the server side and use the Local GPU LLM (0x cloud quota) as a strict forensic disk-evidence extractor. Outputs verbatim signatures, imports, and logic with exact 1-based `<file>:L<line>` citations (<300 tokens), or `"NOT_FOUND_ON_DISK: [symbol/query]"` if absent (automatically escalating to Gemini 3.8 Flash if the local GPU is offline). WHEN TO USE: Always call before raw `Read` on unfamiliar/large files (>150 lines) or whenever verifying disk state before answering or editing. DO NOT USE FOR: Multi-directory architectural synthesis across 10+ files (use `agy_delegate_research` after scouting). RETURNS: Concise markdown bullet digest with `<file>:L<line>` citations and telemetry footer.',
+    annotations: {
+      title: 'Scout Files on Local GPU (Forensic Line Extractor)',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false
+    },
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         file_paths: {
           type: 'array',
+          minItems: 1,
           items: { type: 'string' },
-          description: 'List of relative or absolute file paths to inspect on disk.'
+          description:
+            'List of relative or absolute file paths to inspect on disk (skips binary files and `.env*` secrets).'
         },
         query: {
           type: 'string',
+          minLength: 1,
           description:
-            'Specific symbols, control flow, signatures, or architectural questions to extract from the files.'
+            'Specific symbols, function signatures, imports, or behavior to extract from the numbered files.'
         },
         cwd: {
           type: 'string',
-          description: 'Optional working directory (defaults to workspace root).'
+          description: 'Optional working directory path (defaults to workspace root).'
         }
       },
       required: ['file_paths', 'query']
@@ -2367,21 +2459,34 @@ const MCP_TOOLS = [
   {
     name: 'local_exec_and_triage',
     description:
-      'Execute noisy terminal/test/build commands (pytest, npm test, tsc, cargo check, docker build) in a subprocess with workspace virtualenv/node_modules PATH injected and Windows process-tree kill protection (`taskkill /T /F`). If stdout+stderr is <= 40 lines, returns it directly. If > 40 lines, scrubs passing tests and boilerplate warnings through the local GPU LLM (or escalates to Gemini 3.8 Flash if offline) and returns only the exit code, failing test names, file:line references, and isolated stack traces.',
+      'Execute allow-listed test, build, typecheck, or lint commands (pytest, npm test, npx tsc, cargo check, go test) in a managed subprocess with Windows process-tree kill protection (`taskkill /T /F`) and scrub verbose output on the Local GPU (0x cloud quota). WHEN TO USE: Running any test suite, compiler check, or linter that may produce >40 lines of noisy output. DO NOT USE FOR: Chained shell commands (`&&`, `;`, `|` are blocked) or file edits. RETURNS: Full output directly if <=40 lines; otherwise a Local GPU-scrubbed digest containing only exit code, failing test names, `<file>:<line>` locations, and isolated stack traces.',
+    annotations: {
+      title: 'Execute & Triage Test/Build Logs on Local GPU',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         command: {
           type: 'string',
+          minLength: 1,
           description:
-            'Command line to execute (e.g. "pytest", "npm test", "npx tsc --noEmit", "cargo check").'
+            'Single allow-listed test/build/lint command line without chaining operators (e.g. "pytest", "npm test", "npx tsc --noEmit", "cargo check").'
         },
         working_dir: {
           type: 'string',
-          description: 'Working directory for command execution (defaults to workspace root).'
+          minLength: 1,
+          description: 'Working directory path for command execution.'
         },
         timeout_ms: {
           type: 'number',
+          minimum: 500,
+          maximum: 600000,
+          default: 120000,
           description: 'Optional subprocess timeout in milliseconds (default 120000).'
         }
       },
@@ -2391,28 +2496,38 @@ const MCP_TOOLS = [
   {
     name: 'local_draft_leaf_code',
     description:
-      'Draft leaf-node boilerplate, unit tests, DTOs, or schemas using the local GPU LLM. Reads `reference_files` directly from disk on the server side, validates that the generated code is non-empty (>= 15 chars) and not truncated before writing `target_file` on disk (aborting disk write and escalating to `agy_delegate_edit` `flash-high` if invalid or offline), and returns confirmation + `git diff --stat` summary.',
+      'Draft standalone leaf-node boilerplate, unit test files, DTOs, or schemas on disk using the Local GPU LLM (0x cloud quota). Reads `reference_files` on the server side, validates that the drafted code is >=15 chars with closed markdown fences and no truncation placeholders before writing `target_file` (automatically aborting disk write and escalating to `agy_delegate_edit` `flash-high` if invalid or offline). WHEN TO USE: Creating or updating a single self-contained leaf file (unit tests, schemas, types, boilerplate). DO NOT USE FOR: Complex multi-file refactoring or cross-module architectural edits (use `agy_delegate_edit` instead). RETURNS: Write confirmation, byte/line counts, and `git diff --stat` summary.',
+    annotations: {
+      title: 'Draft Leaf Boilerplate/Tests on Local GPU',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         target_file: {
           type: 'string',
-          description: 'Path to the file to create or update on disk.'
+          minLength: 1,
+          description: 'Relative or absolute path to the single leaf file to create or update on disk.'
         },
         spec: {
           type: 'string',
+          minLength: 1,
           description:
-            'Detailed specification of the leaf code, boilerplate, schema, or test cases to generate.'
+            'Detailed specification of the leaf code, boilerplate, schema, or unit test cases to generate.'
         },
         reference_files: {
           type: 'array',
           items: { type: 'string' },
           description:
-            'List of existing file paths to read from disk as style/type/import references.'
+            'List of existing file paths to read from disk on the server side as style, type, and import references.'
         },
         cwd: {
           type: 'string',
-          description: 'Optional working directory (defaults to workspace root).'
+          description: 'Optional working directory path (defaults to workspace root).'
         }
       },
       required: ['target_file', 'spec', 'reference_files']
