@@ -11,7 +11,7 @@
 
 1. **Tier 0 (Apex Orchestrator):** Claude Code (**Opus / Fable / Sonnet**) handles high-level architectural decisions, surgical multi-line `Edit` patches, and final user synthesis.
 2. **Tier 1 & 2 (Cloud Subagent Governor — Google Antigravity `agy`):** Routes wide-context exploration, disjoint-directory swarms, and deep multi-file reasoning across **Gemini 3.8 Flash** (`1x–2x` weight) and **Gemini 4 Argon** (`4x–6x` weight) with deterministic 5-hour/weekly quota governance and automatic `429` step-down.
-3. **Tier 3 (Local Consumer GPU Context Scrubber — RTX 4070 / Ollama / `llama-server`):** Intercepts high-volume file reads, verbose test/build logs, and leaf-node boilerplate generation on a local GPU (`0x` cloud quota burn), returning `<300 token` forensic `<file>:<line>` digests so raw file bloat and passing test noise never enter cloud context windows.
+3. **Tier 3 (Local Consumer GPU Context Scrubber — Ollama / `llama-server`):** Intercepts high-volume file reads, verbose test/build logs, and leaf-node boilerplate generation on a local GPU (`0x` cloud quota burn), returning `<300 token` forensic `<file>:<line>` digests so raw file bloat and passing test noise never enter cloud context windows.
 
 In production workflows, this spillway architecture **reduces frontier cloud token consumption by 40–60%** while eliminating mid-session **context rot** and **stale-memory hallucinations**.
 
@@ -43,7 +43,7 @@ In production workflows, this spillway architecture **reduces frontier cloud tok
                     v                                           v
 +---------------------------------------+   +---------------------------------------+
 |     TIER 3: LOCAL GPU WORKER (0x)     |   |   TIER 1 & 2: GEMINI CLOUD GOVERNOR   |
-|  RTX 4070 12GB (`127.0.0.1:11434/8080`)|   |     Google Antigravity CLI (`agy`)    |
+|  Local GPU 8-24GB (`127.0.0.1:11434/8080`)|   |     Google Antigravity CLI (`agy`)    |
 |  - Probes Ollama `/api/ps` (hot VRAM) |   |  - `argon-high` (6x) -> `argon-med`   |
 |  - 1-based line numbers + 50/50 slice |   |    -> `argon-low` -> `flash-high`     |
 |  - Forensic `SCOUT_SYSTEM_PROMPT`     |   |    -> `flash-medium` -> `flash-low`   |
@@ -115,7 +115,7 @@ npm test
 
 ### Step 2: Configure Local GPU Inference (Ollama or `llama-server`)
 
-Pick your hardware preset in [`config/model-matrix.json`](./config/model-matrix.json) (`8gb_vram`, `12gb_vram`, or `24gb_vram_or_mac_unified`). For a **12 GB GPU (e.g., NVIDIA RTX 4070)** with **Ollama**:
+Pick your hardware preset in [`config/model-matrix.json`](./config/model-matrix.json) (`8gb_vram`, `12gb_vram`, or `24gb_vram_or_mac_unified`). For a **12 GB VRAM GPU** with **Ollama**:
 
 ```bash
 # Enable Flash Attention, 8-bit quantized KV cache, and 16K context window

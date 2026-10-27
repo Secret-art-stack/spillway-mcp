@@ -87,7 +87,7 @@ const AGY_READONLY_COMMAND_ALLOWLIST = Object.freeze(
 // state can corrupt), so every agy run goes through a single in-process queue.
 const AGY_MAX_CONCURRENCY = 1;
 
-// The local RTX 4070 (12 GB VRAM) can only keep ONE LLM loaded in VRAM at a time
+// The local consumer GPU can only keep ONE LLM loaded in VRAM at a time
 // without PCIe system RAM thrashing. All local GPU requests serialize here.
 const LOCAL_GPU_MAX_CONCURRENCY = 1;
 
@@ -789,7 +789,7 @@ async function executeAgyWithGovernor(options) {
 }
 
 // ============================================================================
-// Tier 3 Local RTX 4070 (12 GB VRAM) Offload Engine & Safeguards
+// Tier 3 Local Consumer GPU Offload Engine & Safeguards
 // ----------------------------------------------------------------------------
 // 1. Ollama `/v1/models` vs `/api/ps` Trap Guard:
 //    - On port 8080 (`llama-server`), `GET /v1/models` only lists the active model.
@@ -835,7 +835,7 @@ function getLocalGpuConfig(matrix = null, profileOverride = null) {
   const m = matrix || readJsonSafe(MODEL_MATRIX_PATH);
   const profileKey = profileOverride || process.env.LOCAL_GPU_PROFILE || m.active_hardware_profile || '12gb_vram';
   const profileCfg = m.hardware_profiles?.[profileKey] || {};
-  const cfg = { ...(m.tiers?.tier_0_local_rtx4070_offload || {}), ...profileCfg };
+  const cfg = { ...(m.tiers?.tier_0_local_gpu_offload || {}), ...profileCfg };
   const rawEndpoints = [
     process.env.LOCAL_LLM_BASE_URL,
     ...(Array.isArray(cfg.endpoints)
@@ -975,7 +975,7 @@ async function probeAndResolveLocalGpu(customConfig = null, fetchImpl = fetch) {
           ? json.models
           : [];
         const firstId =
-          dataArr[0]?.id || dataArr[0]?.model || dataArr[0]?.name || 'local-rtx4070-model';
+          dataArr[0]?.id || dataArr[0]?.model || dataArr[0]?.name || 'local-gpu-model';
         const resolvedModel =
           cfg.preferred_model && cfg.preferred_model !== 'auto' ? cfg.preferred_model : firstId;
 
@@ -1059,7 +1059,7 @@ async function callLocalGpuChatCompletion({
       return {
         ok: false,
         offline: true,
-        reason: probe.reason || 'Local RTX 4070 endpoint offline'
+        reason: probe.reason || 'Local GPU endpoint offline'
       };
     }
 
@@ -1187,7 +1187,7 @@ function sliceHeadTail5050(rawText, maxChars = 80000) {
   const head = rawText.slice(0, half);
   const tail = rawText.slice(rawText.length - half);
   const omittedChars = rawText.length - head.length - tail.length;
-  const marker = `\n\n... [50-50 HEAD/TAIL SLICE: Omitted ${omittedChars} middle chars to fit RTX 4070 context ceiling] ...\n\n`;
+  const marker = `\n\n... [50-50 HEAD/TAIL SLICE: Omitted ${omittedChars} middle chars to fit Local GPU context ceiling] ...\n\n`;
   return {
     text: `${head}${marker}${tail}`,
     sliced: true,
@@ -1237,7 +1237,7 @@ function formatNumberedFileWithHeadTailSlice(rawContent, maxChars = 80000) {
   tailLines.reverse();
 
   const omittedLines = Math.max(0, tailStartIdx - headEndIdx - 1);
-  const marker = `... [50-50 HEAD/TAIL SLICE: Omitted lines ${headEndIdx + 2}..${tailStartIdx} (${omittedLines} lines) to fit RTX 4070 context] ...`;
+  const marker = `... [50-50 HEAD/TAIL SLICE: Omitted lines ${headEndIdx + 2}..${tailStartIdx} (${omittedLines} lines) to fit Local GPU context] ...`;
 
   return {
     text: [...headLines, marker, ...tailLines].join('\n'),
@@ -2048,7 +2048,7 @@ function buildTelemetryFooter(activeModelSlug = null, sessionId = null) {
     `Active Engine: ${effectiveModel} | Session ID: ${effectiveSessionId}`,
     `Session Context Left: ~${remainingK}k / ${maxK}k tokens (${remainingPct}%)`,
     `Gemini Quota Status: 5h Window [${resetTimerStr}] | Argon Tier: ${argonStatus}`,
-    `Local RTX 4070 Tier: ${localModelStr} | Saved: ~${localSavedK}k cloud tokens (${
+    `Local GPU Tier: ${localModelStr} | Saved: ~${localSavedK}k cloud tokens (${
       localTel.successful_local_requests || 0
     } local / ${localTel.fallback_to_cloud_count || 0} escalated)`,
     `Model Watchdog: ${watchdogStr}`,
@@ -2320,13 +2320,14 @@ const MCP_TOOLS = [
           type: 'string',
           description: 'Optional workspace root directory.'
         }
-      }
+      },
+      required: []
     }
   },
   {
     name: 'agy_status',
     description:
-      'Returns current Gemini model availability, active session context remaining, quota cooldown timers, Local RTX 4070 GPU offload telemetry, workspace environment config, Git worktree pre-flight status, IDE HUD sync state, and optionally runs a live `agy models` discovery check.',
+      'Returns current Gemini model availability, active session context remaining, quota cooldown timers, Local GPU offload telemetry, workspace environment config, Git worktree pre-flight status, IDE HUD sync state, and optionally runs a live `agy models` discovery check.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2334,13 +2335,14 @@ const MCP_TOOLS = [
           type: 'boolean',
           description: 'If true, runs `agy models` to check for newly released Gemini models.'
         }
-      }
+      },
+      required: []
     }
   },
   {
     name: 'local_file_scout',
     description:
-      'ZERO-TRUST MEMORY TOOL: Treat prior conversation history as stale—never answer architectural questions or propose edits from memory; always call local_file_scout first to verify current disk state and cite <file>:L<line> evidence. Reads repository files directly from disk on the server side and uses the local RTX 4070 LLM as a strict forensic disk-evidence extractor (or outputs "NOT_FOUND_ON_DISK: [symbol/query]" if absent). Raw file contents never enter Claude Code context. Skips binary files (null byte in first 4KB) and secret `.env*` files, prepends 1-based line numbers, applies 50-50 head/tail slicing if >80,000 chars, and automatically escalates to Gemini 3.8 Flash if the local GPU server is offline.',
+      'ZERO-TRUST MEMORY TOOL: Treat prior conversation history as stale—never answer architectural questions or propose edits from memory; always call local_file_scout first to verify current disk state and cite <file>:L<line> evidence. Reads repository files directly from disk on the server side and uses the local GPU LLM as a strict forensic disk-evidence extractor (or outputs "NOT_FOUND_ON_DISK: [symbol/query]" if absent). Raw file contents never enter Claude Code context. Skips binary files (null byte in first 4KB) and secret `.env*` files, prepends 1-based line numbers, applies 50-50 head/tail slicing if >80,000 chars, and automatically escalates to Gemini 3.8 Flash if the local GPU server is offline.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2365,7 +2367,7 @@ const MCP_TOOLS = [
   {
     name: 'local_exec_and_triage',
     description:
-      'Execute noisy terminal/test/build commands (pytest, npm test, tsc, cargo check, docker build) in a subprocess with workspace virtualenv/node_modules PATH injected and Windows process-tree kill protection (`taskkill /T /F`). If stdout+stderr is <= 40 lines, returns it directly. If > 40 lines, scrubs passing tests and boilerplate warnings through the local RTX 4070 LLM (or escalates to Gemini 3.8 Flash if offline) and returns only the exit code, failing test names, file:line references, and isolated stack traces.',
+      'Execute noisy terminal/test/build commands (pytest, npm test, tsc, cargo check, docker build) in a subprocess with workspace virtualenv/node_modules PATH injected and Windows process-tree kill protection (`taskkill /T /F`). If stdout+stderr is <= 40 lines, returns it directly. If > 40 lines, scrubs passing tests and boilerplate warnings through the local GPU LLM (or escalates to Gemini 3.8 Flash if offline) and returns only the exit code, failing test names, file:line references, and isolated stack traces.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2389,7 +2391,7 @@ const MCP_TOOLS = [
   {
     name: 'local_draft_leaf_code',
     description:
-      'Draft leaf-node boilerplate, unit tests, DTOs, or schemas using the local RTX 4070 LLM. Reads `reference_files` directly from disk on the server side, validates that the generated code is non-empty (>= 15 chars) and not truncated before writing `target_file` on disk (aborting disk write and escalating to `agy_delegate_edit` `flash-high` if invalid or offline), and returns confirmation + `git diff --stat` summary.',
+      'Draft leaf-node boilerplate, unit tests, DTOs, or schemas using the local GPU LLM. Reads `reference_files` directly from disk on the server side, validates that the generated code is non-empty (>= 15 chars) and not truncated before writing `target_file` on disk (aborting disk write and escalating to `agy_delegate_edit` `flash-high` if invalid or offline), and returns confirmation + `git diff --stat` summary.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2705,7 +2707,7 @@ async function handleToolCall(name, args = {}) {
   }
 
   // --------------------------------------------------------------------------
-  // Tool 7: local_file_scout (Tier 3 Local RTX 4070 Offload)
+  // Tool 7: local_file_scout (Tier 3 Local GPU Offload)
   // --------------------------------------------------------------------------
   if (name === 'local_file_scout') {
     const filePaths = Array.isArray(args.file_paths) ? args.file_paths : [];
@@ -2828,7 +2830,7 @@ async function handleToolCall(name, args = {}) {
       return { isError: false, content: [{ type: 'text', text }] };
     }
 
-    // Automatic Cloud Escalation to Gemini 3.8 Flash if local RTX 4070 is offline or errored
+    // Automatic Cloud Escalation to Gemini 3.8 Flash if local GPU is offline or errored
     recordLocalGpuTelemetry({
       localSuccess: false,
       charsOffloaded: 0,
@@ -2852,7 +2854,7 @@ async function handleToolCall(name, args = {}) {
       cwd
     });
 
-    const escalateNote = `> [Governor Note: Local RTX 4070 scout unavailable (${localRes.reason}) -> automatically escalated to ${cloudRes.modelUsed}]`;
+    const escalateNote = `> [Governor Note: Local GPU scout unavailable (${localRes.reason}) -> automatically escalated to ${cloudRes.modelUsed}]`;
     const allNotes = [escalateNote, ...skippedNotes.map(n => `> ${n}`)];
     const text =
       `${formatGovernorNotices(cloudRes, allNotes)}${cloudRes.responseText || ''}` +
@@ -2865,7 +2867,7 @@ async function handleToolCall(name, args = {}) {
   }
 
   // --------------------------------------------------------------------------
-  // Tool 8: local_exec_and_triage (Tier 3 Local RTX 4070 Offload)
+  // Tool 8: local_exec_and_triage (Tier 3 Local GPU Offload)
   // --------------------------------------------------------------------------
   if (name === 'local_exec_and_triage') {
     const command = String(args.command || '').trim();
@@ -2967,13 +2969,13 @@ async function handleToolCall(name, args = {}) {
       };
     }
 
-    // Over 40 lines: scrub passing tests and boilerplate warnings via Local RTX 4070
+    // Over 40 lines: scrub passing tests and boilerplate warnings via Local GPU
     const cfg = getLocalGpuConfig();
     const maxLogChars = cfg.max_triage_input_chars || 80000;
     const slicedLog = sliceHeadTail5050(combinedRaw, maxLogChars);
 
     const systemPrompt = [
-      'You are a build and test log triage scrubber running on a local RTX 4070.',
+      'You are a build and test log triage scrubber running on a local GPU.',
       'Strip all passing tests, progress bars, and routine warnings.',
       'Return ONLY: (1) Exit status summary, (2) Exact failing test names or compiler errors, (3) Exact <file>:<line> references, and (4) Isolated root-cause stack traces.',
       'Keep your response concise and actionable.'
@@ -3009,7 +3011,7 @@ async function handleToolCall(name, args = {}) {
       triggerVisualHudFollowFiles(localRes.content, workingDir);
       const text =
         [
-          `${timeoutBanner}### Triaged Command Output (Scrubbed ${lineCount} lines via Local RTX 4070 \`${localRes.model}\`)`,
+          `${timeoutBanner}### Triaged Command Output (Scrubbed ${lineCount} lines via Local GPU \`${localRes.model}\`)`,
           `- **Command:** \`${command}\` | **Exit Code:** \`${execRes.exitCode}\``,
           '',
           localRes.content.trim()
@@ -3018,7 +3020,7 @@ async function handleToolCall(name, args = {}) {
       return { isError: false, content: [{ type: 'text', text }] };
     }
 
-    // Fallback if Local RTX 4070 is offline: write raw log to temp file so agy (flash-low) can read it from disk
+    // Fallback if Local GPU is offline: write raw log to temp file so agy (flash-low) can read it from disk
     recordLocalGpuTelemetry({
       localSuccess: false,
       charsOffloaded: 0,
@@ -3039,7 +3041,7 @@ async function handleToolCall(name, args = {}) {
         cwd: workingDir
       });
 
-      const escalateNote = `> [Governor Note: Local RTX 4070 triage unavailable (${localRes.reason}) -> escalated log scrubbing (${lineCount} lines) to ${cloudRes.modelUsed}]`;
+      const escalateNote = `> [Governor Note: Local GPU triage unavailable (${localRes.reason}) -> escalated log scrubbing (${lineCount} lines) to ${cloudRes.modelUsed}]`;
       const body =
         cloudRes.ok && cloudRes.responseText
           ? cloudRes.responseText
@@ -3058,7 +3060,7 @@ async function handleToolCall(name, args = {}) {
   }
 
   // --------------------------------------------------------------------------
-  // Tool 9: local_draft_leaf_code (Tier 3 Local RTX 4070 Offload)
+  // Tool 9: local_draft_leaf_code (Tier 3 Local GPU Offload)
   // --------------------------------------------------------------------------
   if (name === 'local_draft_leaf_code') {
     const targetFileRaw = String(args.target_file || '').trim();
@@ -3155,7 +3157,7 @@ async function handleToolCall(name, args = {}) {
       });
 
       const prevText = delegated.content?.[0]?.text || '';
-      const notice = `> [Governor Note: Local RTX 4070 leaf draft skipped/aborted (${reason}); target_file left intact and escalated to \`agy_delegate_edit\` (${fallbackTier})]\n\n`;
+      const notice = `> [Governor Note: Local GPU leaf draft skipped/aborted (${reason}); target_file left intact and escalated to \`agy_delegate_edit\` (${fallbackTier})]\n\n`;
       return {
         isError: delegated.isError,
         content: [{ type: 'text', text: `${notice}${prevText}` }]
@@ -3164,12 +3166,12 @@ async function handleToolCall(name, args = {}) {
 
     if (totalInputChars > maxDraftInputChars) {
       return escalateDraftToCloud(
-        `input size ${totalInputChars} chars exceeds RTX 4070 draft limit of ${maxDraftInputChars} chars`
+        `input size ${totalInputChars} chars exceeds Local GPU draft limit of ${maxDraftInputChars} chars`
       );
     }
 
     const systemPrompt = [
-      'You are an expert code generator running on a local RTX 4070.',
+      'You are an expert code generator running on a local GPU.',
       'Output ONLY the complete, valid file contents for the requested target file wrapped in a single markdown code block (```language ... ```).',
       'Do NOT include conversational filler, explanations, or lazy truncation comments like "// ... rest of code".'
     ].join(' ');
@@ -3192,7 +3194,7 @@ async function handleToolCall(name, args = {}) {
     });
 
     if (!localRes.ok) {
-      return escalateDraftToCloud(localRes.reason || 'Local RTX 4070 endpoint offline');
+      return escalateDraftToCloud(localRes.reason || 'Local GPU endpoint offline');
     }
 
     // Safeguard #2: Validate extracted code before touching target_file on disk
@@ -3239,7 +3241,7 @@ async function handleToolCall(name, args = {}) {
 
     const summaryLines = [
       `### Local Leaf Code Draft Complete (\`${relTarget}\`)`,
-      `- **Engine:** Local RTX 4070 (\`${localRes.model}\` via \`${localRes.provider}\`)`,
+      `- **Engine:** Local GPU (\`${localRes.model}\` via \`${localRes.provider}\`)`,
       `- **Status:** ${targetExistedBefore ? 'Updated existing file' : 'Created new file'} (${linesWritten} lines, ${Buffer.byteLength(
         validation.code,
         'utf8'
@@ -3281,7 +3283,7 @@ const SAFE_READONLY_MCP_TOOLS = Object.freeze([
   'local_file_scout'
 ]);
 
-// Forensic disk-evidence system prompt for `local_file_scout` (used on both the local RTX 4070
+// Forensic disk-evidence system prompt for `local_file_scout` (used on both the local GPU
 // and the cloud Gemini Flash fallback so neither model can guess or hallucinate symbols).
 const SCOUT_SYSTEM_PROMPT = [
   'You are a strict disk-evidence extractor.',
@@ -3294,11 +3296,11 @@ const SCOUT_SYSTEM_PROMPT = [
 // Returned in the MCP `initialize` response (`result.instructions`) so Claude Code
 // receives routing guidance natively without requiring root CLAUDE.md / AGENTS.md files.
 const MCP_SERVER_INSTRUCTIONS = [
-  'Tiered Offload & Disk-Truth Rules (`agy-subagent` + Tier 3 Local RTX 4070 Offload Layer):',
+  'Tiered Offload & Disk-Truth Rules (`agy-subagent` + Tier 3 Local GPU Offload Layer):',
   '1. ZERO-TRUST MEMORY: Treat prior conversation history as stale. Never answer architectural questions or propose edits from memory—always call `local_file_scout` (0x quota) to verify current disk state and cite `<file>:<line>` evidence first.',
-  '2. Tier 3 Local RTX 4070 Offload (0x cloud quota burn, server-side disk/log access):',
+  '2. Tier 3 Local GPU Offload (0x cloud quota burn, server-side disk/log access):',
   '   - `local_file_scout(file_paths, query)`: Forensic disk-evidence extractor. Use before raw `Read` on large/unfamiliar files (>150 lines) to extract verbatim `<file>:L<line>` signatures and imports (<300 tokens), or `"NOT_FOUND_ON_DISK: [symbol/query]"` if absent. Automatically escalates to `gemini-3.8-flash-low` if the local GPU endpoint is offline.',
-  '   - `local_exec_and_triage(command, working_dir)`: Use to run and scrub verbose test/build output (>40 lines) (`pytest`, `npm test`, `tsc`, `cargo check`). Returns logs <=40 lines directly; scrubs logs >40 lines via the RTX 4070 (or `flash-low` fallback).',
+  '   - `local_exec_and_triage(command, working_dir)`: Use to run and scrub verbose test/build output (>40 lines) (`pytest`, `npm test`, `tsc`, `cargo check`). Returns logs <=40 lines directly; scrubs logs >40 lines via the Local GPU (or `flash-low` fallback).',
   '   - `local_draft_leaf_code(target_file, spec, reference_files)`: Use to draft boilerplate/tests to disk with an empty/truncation overwrite guard, then inspect `git diff`.',
   '3. Cloud Gemini Tiers (`agy_delegate_research`, `agy_spawn_swarm`, `agy_delegate_edit`, `agy_session_followup`):',
   '   - `flash-low` / `flash-medium` (1x burn): Wide repo triage, log scanning, disjoint-path swarms (`agy_spawn_swarm`).',
@@ -3312,7 +3314,7 @@ const MCP_SERVER_INSTRUCTIONS = [
 const CLAUDE_MD_GOVERNOR_BLOCK = `${MARKER_START}
 ## Antigravity Subagent Delegation Rules
 
-You are connected to the **Antigravity Subagent Governor** MCP server (\`agy-subagent\`), which wraps the local Google Antigravity CLI (\`agy\`), the **Tier 3 Local RTX 4070 Offload Layer**, and the **Antigravity IDE Visual HUD**.
+You are connected to the **Antigravity Subagent Governor** MCP server (\`agy-subagent\`), which wraps the local Google Antigravity CLI (\`agy\`), the **Tier 3 Local GPU Offload Layer**, and the **Antigravity IDE Visual HUD**.
 
 ### 0. Setup, CLI Fallback & Optional Workspace Configuration
 
@@ -3345,29 +3347,29 @@ Because \`agy-subagent\` is a \`stdio\` MCP server registered in \`.mcp.json\`, 
 * **Never** invoke \`claude-*\` or \`gpt-oss-*\` models inside \`agy\` subagents.
 * **Deterministic Fallback Chain:** \`gemini-4-argon-high\` -> \`gemini-4-argon-medium\` -> \`gemini-4-argon-low\` -> \`gemini-3.8-flash-high\` -> \`gemini-3.8-flash-medium\` -> \`gemini-3.8-flash-low\`.
 
-### 1A. Mandatory Tier 3 Local GPU First-Pass Offload (RTX 4070 — 0x Quota Burn)
+### 1A. Mandatory Tier 3 Local GPU First-Pass Offload (Local GPU — 0x Quota Burn)
 
-Before calling Claude's raw \`Read\` on large/unfamiliar files, running noisy test/build suites via \`Bash\`, or spending Gemini cloud quota, **Opus/Fable and Argon MUST route context-heavy leaf tasks to the local RTX 4070 tools**:
+Before calling Claude's raw \`Read\` on large/unfamiliar files, running noisy test/build suites via \`Bash\`, or spending Gemini cloud quota, **Opus/Fable and Argon MUST route context-heavy leaf tasks to the local GPU tools**:
 
 | Local Tool | Replaces | Hard Rule for Opus / Fable / Argon |
 | :--- | :--- | :--- |
 | **\`local_file_scout\`** | Raw \`Read\` on files >150 lines or multi-file signature lookups | **Never** \`Read\` full source files just to find signatures, imports, or line numbers. Call \`local_file_scout(file_paths, query)\` first to get a \`<300 token\` \`<file>:<line>\` digest, then use targeted line-range \`Read\` only on the exact lines you need to edit. |
-| **\`local_exec_and_triage\`** | Raw \`Bash\` for \`pytest\`, \`npm test\`, \`tsc\`, \`cargo check\`, \`docker build\` | **Never** run verbose test or build suites directly in \`Bash\` where passing test logs pollute context. Always run them via \`local_exec_and_triage(command, working_dir)\` so logs >40 lines are scrubbed locally on the RTX 4070. |
-| **\`local_draft_leaf_code\`** | Writing repetitive unit tests, DTOs, schemas, or boilerplate in Claude output tokens | **Never** spend Opus/Fable output tokens generating routine boilerplate or test files from scratch. Call \`local_draft_leaf_code(target_file, spec, reference_files)\` to write the draft on disk via the RTX 4070, then review the resulting \`git diff\` and apply surgical fixes with \`Edit\`. |
+| **\`local_exec_and_triage\`** | Raw \`Bash\` for \`pytest\`, \`npm test\`, \`tsc\`, \`cargo check\`, \`docker build\` | **Never** run verbose test or build suites directly in \`Bash\` where passing test logs pollute context. Always run them via \`local_exec_and_triage(command, working_dir)\` so logs >40 lines are scrubbed locally on the Local GPU. |
+| **\`local_draft_leaf_code\`** | Writing repetitive unit tests, DTOs, schemas, or boilerplate in Claude output tokens | **Never** spend Opus/Fable output tokens generating routine boilerplate or test files from scratch. Call \`local_draft_leaf_code(target_file, spec, reference_files)\` to write the draft on disk via the Local GPU, then review the resulting \`git diff\` and apply surgical fixes with \`Edit\`. |
 
-* **Single-Model VRAM Constraint & Safeguards:** The local RTX 4070 (12 GB VRAM) keeps **one** model loaded at a time (\`localhost:8080/v1\` or \`localhost:11434/v1\`, probing Ollama \`/api/ps\` first with \`keep_alive: "30m"\`) and serializes requests. Do not pass raw file contents in tool arguments—always pass **file paths** so the MCP server reads them directly from disk.
-* **Automatic Cloud Escalation:** If the local GPU server is offline, if drafted code fails validation (<15 chars or truncated), or if inputs exceed the RTX 4070 context ceiling, the MCP server automatically escalates to \`gemini-3.8-flash-low\` / \`flash-high\` without failing the turn.
+* **Single-Model VRAM Constraint & Safeguards:** The local consumer GPU keeps **one** model loaded at a time (\`localhost:8080/v1\` or \`localhost:11434/v1\`, probing Ollama \`/api/ps\` first with \`keep_alive: "30m"\`) and serializes requests. Do not pass raw file contents in tool arguments—always pass **file paths** so the MCP server reads them directly from disk.
+* **Automatic Cloud Escalation:** If the local GPU server is offline, if drafted code fails validation (<15 chars or truncated), or if inputs exceed the Local GPU context ceiling, the MCP server automatically escalates to \`gemini-3.8-flash-low\` / \`flash-high\` without failing the turn.
 
 ### 2. Available MCP Tools
 
 1. **\`agy_configure_workspace\`**: Provision project toolchains (\`.venv\`, \`PATH\`, \`env_overrides\`, \`--add-dir\`), sync \`.vscode/settings.json\`, and attach/open the Antigravity IDE window safely.
-2. **\`agy_status\`**: Inspect Gemini quota health, Local RTX 4070 GPU status/telemetry, active session IDs, auto-detected workspace toolchains, and newly discovered Gemini models.
+2. **\`agy_status\`**: Inspect Gemini quota health, Local GPU status/telemetry, active session IDs, auto-detected workspace toolchains, and newly discovered Gemini models.
 3. **\`agy_delegate_research\`**: Read-only analysis (\`--mode=plan\`). Pass \`tier\`, \`prompt\`, and optional \`files_to_follow\`.
 4. **\`agy_spawn_swarm\`**: Dispatch \`gemini-3.8-flash-low\` / \`gemini-3.8-flash-medium\` subagents across **strictly disjoint directory partitions** (\`paths: ["src/auth/**"]\` vs \`paths: ["src/db/**"]\`). Partitions are validated, then tasks run **one at a time** (agy processes are serialized).
 5. **\`agy_delegate_edit\`**: Delegate scoped file edits (\`allow_shell: false\` -> \`--mode=accept-edits\`). Note: \`allow_shell: true\` (\`--dangerously-skip-permissions\`) is disabled by default unless \`AGY_ALLOW_SKIP_PERMISSIONS=1\` is set.
 6. **\`agy_session_followup\`**: Resume an existing \`conversation_id\` (or \`"latest"\`) so previously loaded files stay in \`agy\`'s context cache (auto-compacts at 80% context usage).
-7. **\`local_file_scout\`**: Server-side disk reader + RTX 4070 signature/line-number extractor (skips binary/secret files, 50-50 head/tail slices >80K chars, \`max_tokens: 600\`).
-8. **\`local_exec_and_triage\`**: Server-side subprocess runner + RTX 4070 log scrubber for noisy test/build commands (>40 lines scrubbed, Windows \`taskkill /T /F\` tree-kill on timeout).
+7. **\`local_file_scout\`**: Server-side disk reader + Local GPU signature/line-number extractor (skips binary/secret files, 50-50 head/tail slices >80K chars, \`max_tokens: 600\`).
+8. **\`local_exec_and_triage\`**: Server-side subprocess runner + Local GPU log scrubber for noisy test/build commands (>40 lines scrubbed, Windows \`taskkill /T /F\` tree-kill on timeout).
 9. **\`local_draft_leaf_code\`**: Server-side leaf boilerplate/test generator writing directly to \`target_file\` with empty/truncation overwrite guard and \`git diff --stat\` output.
 
 ### 3. Headless Permission Behavior (Read Before Delegating)

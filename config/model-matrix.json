@@ -8,7 +8,7 @@
   "active_hardware_profile": "12gb_vram",
   "hardware_profiles": {
     "8gb_vram": {
-      "label": "8 GB VRAM (e.g., NVIDIA RTX 3060 / RTX 4060)",
+      "label": "8 GB VRAM Tier (Entry Consumer GPU)",
       "max_input_chars": 48000,
       "max_scout_input_chars": 48000,
       "max_triage_input_chars": 48000,
@@ -22,7 +22,7 @@
       ]
     },
     "12gb_vram": {
-      "label": "12 GB VRAM (Default: NVIDIA RTX 4070 / RTX 3060 12GB / RTX 4070 Super)",
+      "label": "12 GB VRAM Tier (Default Mid-Range Consumer GPU)",
       "max_input_chars": 80000,
       "max_scout_input_chars": 80000,
       "max_triage_input_chars": 80000,
@@ -36,7 +36,7 @@
       ]
     },
     "24gb_vram_or_mac_unified": {
-      "label": "24 GB+ VRAM or Apple Silicon Unified Memory (RTX 3090 / 4090 / Mac M-Series 32GB+)",
+      "label": "24 GB+ VRAM or Unified Memory Tier (High-End GPU / Apple Silicon 32GB+)",
       "max_input_chars": 140000,
       "max_scout_input_chars": 140000,
       "max_triage_input_chars": 140000,
@@ -75,7 +75,7 @@
     "gemini-3.8-flash-low"
   ],
   "tiers": {
-    "tier_0_local_rtx4070_offload": {
+    "tier_0_local_gpu_offload": {
       "label": "Tier 0 / Local GPU — Consumer GPU Context Scrubbing & Leaf Offload",
       "endpoints": [
         "http://127.0.0.1:8080/v1",

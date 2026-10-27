@@ -31,7 +31,7 @@
     "ollama",
     "llama-cpp",
     "hybrid-inference",
-    "rtx-4070",
+    "local-gpu",
     "context-engineering"
   ],
   "engines": {
