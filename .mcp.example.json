@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "agy-subagent": {
+      "command": "node",
+      "args": [
+        "./spillway-mcp/server/index.js"
+      ],
+      "timeout": 600000,
+      "env": {
+        "AGY_NO_SELF_BOOTSTRAP": "1",
+        "AGY_GIT_REPORT_ONLY": "1",
+        "AGY_DENY_SKIP_PERMISSIONS": "1",
+        "LOCAL_GPU_PROFILE": "12gb_vram",
+        "LOCAL_LLM_BASE_URL": "http://127.0.0.1:11434/v1",
+        "LOCAL_OLLAMA_MODEL": "qwen2.5-coder:14b"
+      }
+    }
+  }
+}

@@ -1,0 +1,197 @@
+{
+  "schema_version": "1.2.0",
+  "strict_filter_prefix": "gemini-",
+  "ignored_prefixes": [
+    "claude-",
+    "gpt-oss-"
+  ],
+  "active_hardware_profile": "12gb_vram",
+  "hardware_profiles": {
+    "8gb_vram": {
+      "label": "8 GB VRAM (e.g., NVIDIA RTX 3060 / RTX 4060)",
+      "max_input_chars": 48000,
+      "max_scout_input_chars": 48000,
+      "max_triage_input_chars": 48000,
+      "max_draft_input_chars": 40000,
+      "recommended_context_tokens": 12288,
+      "recommended_kv_cache": "q8_0",
+      "recommended_models": [
+        "qwen2.5-coder:7b-instruct-q4_K_M",
+        "qwen3.5:9b-q4_K_M",
+        "gemma4:9b-instruct-q4_K_M"
+      ]
+    },
+    "12gb_vram": {
+      "label": "12 GB VRAM (Default: NVIDIA RTX 4070 / RTX 3060 12GB / RTX 4070 Super)",
+      "max_input_chars": 80000,
+      "max_scout_input_chars": 80000,
+      "max_triage_input_chars": 80000,
+      "max_draft_input_chars": 64000,
+      "recommended_context_tokens": 16384,
+      "recommended_kv_cache": "q8_0",
+      "recommended_models": [
+        "qwen2.5-coder:14b",
+        "qwen3.5:9b-q6_K",
+        "gemma4:12b-instruct-q4_K_M"
+      ]
+    },
+    "24gb_vram_or_mac_unified": {
+      "label": "24 GB+ VRAM or Apple Silicon Unified Memory (RTX 3090 / 4090 / Mac M-Series 32GB+)",
+      "max_input_chars": 140000,
+      "max_scout_input_chars": 140000,
+      "max_triage_input_chars": 140000,
+      "max_draft_input_chars": 110000,
+      "recommended_context_tokens": 32768,
+      "recommended_kv_cache": "q8_0",
+      "recommended_models": [
+        "qwen3.8:27b-q4_K_M",
+        "gemma4:26b-a4b-q4_K_M",
+        "qwen2.5-coder:32b-instruct-q4_K_M"
+      ]
+    }
+  },
+  "baseline_models": [
+    "gemini-4-argon-high",
+    "gemini-4-argon-medium",
+    "gemini-4-argon-low",
+    "gemini-3.8-flash-high",
+    "gemini-3.8-flash-medium",
+    "gemini-3.8-flash-low"
+  ],
+  "tier_aliases": {
+    "flash-low": "gemini-3.8-flash-low",
+    "flash-medium": "gemini-3.8-flash-medium",
+    "flash-high": "gemini-3.8-flash-high",
+    "argon-low": "gemini-4-argon-low",
+    "argon-medium": "gemini-4-argon-medium",
+    "argon-high": "gemini-4-argon-high"
+  },
+  "fallback_chain": [
+    "gemini-4-argon-high",
+    "gemini-4-argon-medium",
+    "gemini-4-argon-low",
+    "gemini-3.8-flash-high",
+    "gemini-3.8-flash-medium",
+    "gemini-3.8-flash-low"
+  ],
+  "tiers": {
+    "tier_0_local_rtx4070_offload": {
+      "label": "Tier 0 / Local GPU — Consumer GPU Context Scrubbing & Leaf Offload",
+      "endpoints": [
+        "http://127.0.0.1:8080/v1",
+        "http://127.0.0.1:11434/v1"
+      ],
+      "preferred_model": "auto",
+      "default_ollama_model": "qwen2.5-coder:14b",
+      "allow_cold_ollama_load": true,
+      "keep_alive": "30m",
+      "probe_timeout_ms": 1500,
+      "request_timeout_ms": 90000,
+      "max_scout_input_chars": 80000,
+      "max_triage_input_chars": 80000,
+      "max_draft_input_chars": 64000,
+      "scout_max_tokens": 600,
+      "triage_max_tokens": 600,
+      "draft_max_tokens": 2048,
+      "fallback_cloud_tier_scout": "flash-low",
+      "fallback_cloud_tier_triage": "flash-low",
+      "fallback_cloud_tier_draft": "flash-high",
+      "quota_burn_weight": 0
+    },
+    "tier_1_fast_swarm_triage": {
+      "label": "Tier 1 — Fast Swarm & Triage",
+      "models": [
+        "gemini-3.8-flash-low",
+        "gemini-3.8-flash-medium"
+      ],
+      "best_for": "Wide repo search, file discovery, log scanning, syntax checks, and high-concurrency parallel subagent swarms.",
+      "context_ceiling_tokens": 1000000,
+      "quota_burn_weight": 1
+    },
+    "tier_2_heavy_flash_analysis": {
+      "label": "Tier 2 — Heavy Flash Analysis",
+      "models": [
+        "gemini-3.8-flash-high"
+      ],
+      "best_for": "Multi-file module summaries, routine test generation, and fast second-opinion verification before burning Argon quota.",
+      "context_ceiling_tokens": 1000000,
+      "quota_burn_weight": 2
+    },
+    "tier_3_standard_deep_reasoning": {
+      "label": "Tier 3 — Standard Deep Reasoning",
+      "models": [
+        "gemini-4-argon-low",
+        "gemini-4-argon-medium"
+      ],
+      "best_for": "Complex cross-module tracing, subtle bug investigation, and refactor planning across 15–30 files.",
+      "context_ceiling_tokens": 1000000,
+      "max_extended_context_tokens": 2000000,
+      "quota_burn_weight": 4
+    },
+    "tier_4_apex_architecture_security": {
+      "label": "Tier 4 — Apex Architecture & Security",
+      "models": [
+        "gemini-4-argon-high"
+      ],
+      "best_for": "Deep architectural design, large-scale codebase ingestion (30+ files), security/race-condition audits, and root-cause analysis of hard bugs.",
+      "context_ceiling_tokens": 1000000,
+      "max_extended_context_tokens": 2000000,
+      "quota_burn_weight": 6,
+      "auto_stepdown_below_5h_quota_pct": 30,
+      "auto_stepdown_target": "gemini-4-argon-medium"
+    }
+  },
+  "models": {
+    "gemini-3.8-flash-low": {
+      "slug": "gemini-3.8-flash-low",
+      "display_name": "Gemini 3.8 Flash (Low)",
+      "family": "flash",
+      "tier": 1,
+      "context_ceiling_tokens": 1000000,
+      "quota_burn_weight": 1
+    },
+    "gemini-3.8-flash-medium": {
+      "slug": "gemini-3.8-flash-medium",
+      "display_name": "Gemini 3.8 Flash (Medium)",
+      "family": "flash",
+      "tier": 1,
+      "context_ceiling_tokens": 1000000,
+      "quota_burn_weight": 1
+    },
+    "gemini-3.8-flash-high": {
+      "slug": "gemini-3.8-flash-high",
+      "display_name": "Gemini 3.8 Flash (High)",
+      "family": "flash",
+      "tier": 2,
+      "context_ceiling_tokens": 1000000,
+      "quota_burn_weight": 2
+    },
+    "gemini-4-argon-low": {
+      "slug": "gemini-4-argon-low",
+      "display_name": "Gemini 4 Argon (Low)",
+      "family": "argon",
+      "tier": 3,
+      "context_ceiling_tokens": 1000000,
+      "quota_burn_weight": 4
+    },
+    "gemini-4-argon-medium": {
+      "slug": "gemini-4-argon-medium",
+      "display_name": "Gemini 4 Argon (Medium)",
+      "family": "argon",
+      "tier": 3,
+      "context_ceiling_tokens": 1000000,
+      "quota_burn_weight": 4
+    },
+    "gemini-4-argon-high": {
+      "slug": "gemini-4-argon-high",
+      "display_name": "Gemini 4 Argon (High)",
+      "family": "argon",
+      "tier": 4,
+      "context_ceiling_tokens": 1000000,
+      "quota_burn_weight": 6
+    }
+  },
+  "discovered_models": [],
+  "new_gemini_model_detected": false,
+  "last_discovery_check": null
+}

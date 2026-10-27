@@ -1,0 +1,41 @@
+{
+  "name": "spillway-mcp",
+  "version": "1.2.0",
+  "description": "Zero-dependency Node.js MCP server implementing a 3-Tier Hybrid Inference Waterfall (Claude Code Opus / Fable / Sonnet -> Gemini Argon/Flash Quota Governor -> Local GPU Context Scrubber).",
+  "main": "server/index.js",
+  "bin": {
+    "spillway-mcp": "./server/index.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Secret-art-stack/spillway-mcp.git"
+  },
+  "homepage": "https://github.com/Secret-art-stack/spillway-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/Secret-art-stack/spillway-mcp/issues"
+  },
+  "scripts": {
+    "start": "node server/index.js",
+    "bootstrap": "node server/index.js --bootstrap",
+    "test": "node server/smoke-test.js"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "spillway-mcp",
+    "claude-code",
+    "opus",
+    "fable",
+    "gemini",
+    "antigravity",
+    "ollama",
+    "llama-cpp",
+    "hybrid-inference",
+    "rtx-4070",
+    "context-engineering"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "Apache-2.0"
+}

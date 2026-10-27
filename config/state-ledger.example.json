@@ -1,0 +1,81 @@
+{
+  "schema_version": "1.2.0",
+  "active_session_id": null,
+  "context_compaction_threshold": 0.8,
+  "sessions": {},
+  "local_gpu_telemetry": {
+    "total_requests": 0,
+    "successful_local_requests": 0,
+    "fallback_to_cloud_count": 0,
+    "total_chars_offloaded": 0,
+    "estimated_cloud_tokens_saved": 0,
+    "last_active_endpoint": null,
+    "last_active_model": null,
+    "last_status": "unprobed"
+  },
+  "model_quotas": {
+    "shared_5h_window": {
+      "window_start_timestamp": null,
+      "window_duration_seconds": 18000,
+      "estimated_requests_in_window": 0,
+      "weighted_burn_units_in_window": 0,
+      "max_weighted_burn_units": 240,
+      "estimated_remaining_pct": 100,
+      "locked_until_timestamp": null
+    },
+    "shared_weekly_window": {
+      "window_start_timestamp": null,
+      "window_duration_seconds": 604800,
+      "estimated_requests_in_window": 0,
+      "weighted_burn_units_in_window": 0,
+      "max_weighted_burn_units": 2400,
+      "estimated_remaining_pct": 100,
+      "locked_until_timestamp": null
+    },
+    "per_model_locks": {
+      "gemini-4-argon-high": {
+        "locked_until_timestamp": null,
+        "last_429_at": null,
+        "last_reset_raw": null,
+        "total_requests": 0,
+        "total_tokens": 0
+      },
+      "gemini-4-argon-medium": {
+        "locked_until_timestamp": null,
+        "last_429_at": null,
+        "last_reset_raw": null,
+        "total_requests": 0,
+        "total_tokens": 0
+      },
+      "gemini-4-argon-low": {
+        "locked_until_timestamp": null,
+        "last_429_at": null,
+        "last_reset_raw": null,
+        "total_requests": 0,
+        "total_tokens": 0
+      },
+      "gemini-3.8-flash-high": {
+        "locked_until_timestamp": null,
+        "last_429_at": null,
+        "last_reset_raw": null,
+        "total_requests": 0,
+        "total_tokens": 0
+      },
+      "gemini-3.8-flash-medium": {
+        "locked_until_timestamp": null,
+        "last_429_at": null,
+        "last_reset_raw": null,
+        "total_requests": 0,
+        "total_tokens": 0
+      },
+      "gemini-3.8-flash-low": {
+        "locked_until_timestamp": null,
+        "last_429_at": null,
+        "last_reset_raw": null,
+        "total_requests": 0,
+        "total_tokens": 0
+      }
+    }
+  },
+  "last_updated_at": null
+}

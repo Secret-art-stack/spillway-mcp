@@ -1,0 +1,22 @@
+# Live runtime state & IDE sync files (auto-initialized from *.example.json)
+config/state-ledger.json
+config/ide-sync.json
+state-ledger.json
+ide-sync.json
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Logs & temporary artifacts
+*.log
+logs/
+tmp/
+.claude/
+.mcp.json
+
+# OS & Node
+node_modules/
+.DS_Store
+Thumbs.db
