@@ -20,10 +20,26 @@ const { spawn, spawnSync } = require('child_process');
 // state files (state-ledger.json, ide-sync.json) are tested in a sandbox
 // without leaving machine-specific paths inside the git repository.
 const REPO_ROOT = path.resolve(__dirname, '..');
-const REPO_CONFIG_DIR = path.join(REPO_ROOT, 'config');
+const REPO_CONFIG_DIR = fs.existsSync(path.join(REPO_ROOT, 'config'))
+  ? path.join(REPO_ROOT, 'config')
+  : REPO_ROOT;
 const SANDBOX_CONFIG_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-smoke-cfg-'));
-for (const entry of fs.readdirSync(REPO_CONFIG_DIR)) {
-  fs.copyFileSync(path.join(REPO_CONFIG_DIR, entry), path.join(SANDBOX_CONFIG_DIR, entry));
+for (const entry of fs.readdirSync(REPO_CONFIG_DIR, { withFileTypes: true })) {
+  if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+  if (entry.name === 'package.json' || entry.name === 'package-lock.json') continue;
+  fs.copyFileSync(path.join(REPO_CONFIG_DIR, entry.name), path.join(SANDBOX_CONFIG_DIR, entry.name));
+}
+// Ensure *.example.json templates exist in the sandbox (even in embedded layouts that only ship live *.json)
+// and remove live state files in the sandbox so ensureRuntimeStateFiles() is deterministically tested.
+for (const base of ['state-ledger', 'ide-sync']) {
+  const liveFile = path.join(SANDBOX_CONFIG_DIR, `${base}.json`);
+  const exampleFile = path.join(SANDBOX_CONFIG_DIR, `${base}.example.json`);
+  if (!fs.existsSync(exampleFile) && fs.existsSync(liveFile)) {
+    fs.copyFileSync(liveFile, exampleFile);
+  }
+  if (fs.existsSync(liveFile)) {
+    fs.rmSync(liveFile, { force: true });
+  }
 }
 process.env.AGY_CONFIG_DIR = SANDBOX_CONFIG_DIR;
 
@@ -70,9 +86,9 @@ async function runOfflineChecks() {
 
   // 0a. Auto-initialization of state-ledger.json & ide-sync.json from *.example.json
   assert(
-    !fs.existsSync(path.join(REPO_CONFIG_DIR, 'state-ledger.json')) &&
-      !fs.existsSync(path.join(REPO_CONFIG_DIR, 'ide-sync.json')),
-    'Repo config/ directory contains only *.example.json templates (no live state files)'
+    !fs.existsSync(path.join(SANDBOX_CONFIG_DIR, 'state-ledger.json')) &&
+      !fs.existsSync(path.join(SANDBOX_CONFIG_DIR, 'ide-sync.json')),
+    'Sandbox config directory starts with *.example.json templates (no live state files)'
   );
   const initFiles = governor.ensureRuntimeStateFiles();
   assert(
