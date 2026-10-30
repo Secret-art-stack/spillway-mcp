@@ -1,6 +1,6 @@
 {
   "name": "spillway-mcp",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Zero-dependency Node.js MCP server implementing a 3-Tier Hybrid Inference Waterfall (Claude Code Opus / Fable / Sonnet -> Gemini Argon/Flash Quota Governor -> Local GPU Context Scrubber).",
   "main": "server/index.js",
   "bin": {

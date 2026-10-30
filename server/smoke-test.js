@@ -649,6 +649,24 @@ async function runSmokeTest() {
           inFlightSession.prompt_preview.startsWith('MOCK_DELAY_800MS Inspect PKHeX'),
         '5c. Session is registered in ledger.sessions AT START with state="running", started_at, elapsed_s, tier, and prompt_preview'
       );
+      assert(
+        inFlightJson.active_session_id !== asyncJobId,
+        '5i. Provisional job-... ID never clobbers active_session_id while run is in flight'
+      );
+
+      // Verify agy_session_followup with an in-flight job_id returns a fast, helpful error pointing to agy_job_result
+      const followupWhileRunningRes = await sendRpc('tools/call', {
+        name: 'agy_session_followup',
+        arguments: {
+          conversation_id: asyncJobId,
+          prompt: 'Follow up prematurely'
+        }
+      });
+      assert(
+        Boolean(followupWhileRunningRes.result.isError) &&
+          followupWhileRunningRes.result.content[0].text.includes('agy_job_result'),
+        '5j-pre. agy_session_followup rejects in-flight job_id immediately and directs caller to agy_job_result'
+      );
 
       // Fetch completed job result via agy_job_result (waiting up to 3000ms for the 800ms mock child to finish)
       const jobFetchRes = await sendRpc('tools/call', {
@@ -664,6 +682,20 @@ async function runSmokeTest() {
           jobFetchText.includes('MOCK_AGY_COMPLETE_ANSWER_OK: Analyzed PKHeX trees cleanly.') &&
           jobFetchText.includes('`done`'),
         '5d. agy_job_result retrieves the full stored response once the background child completes'
+      );
+
+      // Verify agy_session_followup with a completed job_id resolves its real conversation_id
+      const followupCompletedJobRes = await sendRpc('tools/call', {
+        name: 'agy_session_followup',
+        arguments: {
+          conversation_id: asyncJobId,
+          prompt: 'Follow up after completion'
+        }
+      });
+      assert(
+        !followupCompletedJobRes.result.isError &&
+          followupCompletedJobRes.result.content[0].text.includes('MOCK_AGY_COMPLETE_ANSWER_OK'),
+        '5j-post. agy_session_followup transparently resolves a completed job_id to its real conversation_id'
       );
 
       // Test agy_cancel on a stuck/long job
@@ -724,6 +756,40 @@ async function runSmokeTest() {
           fs.unlinkSync(watchdogRes.logFilePath);
         }
       } catch (_) {}
+
+      // Test orphaned running job/session reconciliation (simulating crashed prior server PID)
+      const fakeOrphanLedger = {
+        active_session_id: 'job-orphan-999',
+        sessions: {
+          'job-orphan-999': {
+            conversation_id: 'job-orphan-999',
+            job_id: 'job-orphan-999',
+            state: 'running',
+            pid: 99999999,
+            started_at: new Date(Date.now() - 60000).toISOString()
+          }
+        },
+        jobs: {
+          'job-orphan-999': {
+            job_id: 'job-orphan-999',
+            state: 'running',
+            pid: 99999999,
+            started_at: new Date(Date.now() - 60000).toISOString(),
+            result: null
+          }
+        }
+      };
+      const orphanChanged = governor.reconcileOrphanedJobsAndSessions(fakeOrphanLedger, {
+        persistIfChanged: false
+      });
+      assert(
+        orphanChanged === true &&
+          fakeOrphanLedger.jobs['job-orphan-999'].state === 'failed' &&
+          fakeOrphanLedger.sessions['job-orphan-999'].state === 'failed' &&
+          fakeOrphanLedger.active_session_id === null &&
+          Boolean(fakeOrphanLedger.jobs['job-orphan-999'].result),
+        '5k. reconcileOrphanedJobsAndSessions heals stale running jobs/sessions with dead PIDs and clears provisional active_session_id'
+      );
 
       console.log(`\n=== Smoke Test Complete. Zero stdout framing errors: ${framingErrors === 0} ===`);
       assert(framingErrors === 0, 'zero stdout framing errors');

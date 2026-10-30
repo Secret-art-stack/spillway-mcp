@@ -424,6 +424,129 @@ function configureWorkspaceEnvironment(options = {}, cwd = WORKSPACE_ROOT) {
   };
 }
 
+function isPidAlive(pid) {
+  if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return Boolean(err && err.code === 'EPERM');
+  }
+}
+
+// Reconcile orphaned 'running' / 'queued' jobs & sessions in state-ledger.json whose owning
+// MCP server or child PID exited before completion.
+function reconcileOrphanedJobsAndSessions(
+  ledger,
+  { persistIfChanged = false, forceMarkNonLocal = false } = {}
+) {
+  if (!ledger || typeof ledger !== 'object') return false;
+  const now = Date.now();
+  const nowIso = new Date(now).toISOString();
+  let changed = false;
+
+  if (ledger.jobs && typeof ledger.jobs === 'object') {
+    for (const [jobId, job] of Object.entries(ledger.jobs)) {
+      if (!job || (job.state !== 'running' && job.state !== 'queued')) continue;
+      if (agyActiveJobs.has(jobId)) continue;
+
+      const alive = job.pid ? isPidAlive(job.pid) : false;
+      const startMs = Date.parse(job.started_at || job.queued_at || 0);
+      const isStaleQueued =
+        job.state === 'queued' &&
+        !job.pid &&
+        (forceMarkNonLocal || !Number.isFinite(startMs) || now - startMs > 5000);
+
+      if ((job.state === 'running' && !alive) || isStaleQueued) {
+        const elapsedS = computeLiveElapsedSeconds(job);
+        const orphanMsg =
+          job.error ||
+          'Orphaned in-flight job: previous MCP server or agy process exited before completion.';
+        job.state = 'failed';
+        job.finished_at = job.finished_at || nowIso;
+        job.elapsed_s = elapsedS;
+        job.error = orphanMsg;
+        if (!job.result) {
+          job.result = {
+            ok: false,
+            cancelled: false,
+            timedOut: false,
+            jobId: job.job_id || jobId,
+            state: 'failed',
+            startedAt: job.started_at || job.queued_at || nowIso,
+            elapsedSeconds: elapsedS,
+            modelUsed: job.model || null,
+            stepDownReason: null,
+            conversationId: job.conversation_id || null,
+            responseText: '',
+            deniedActions: [],
+            responseEmpty: true,
+            governorAlerts: [],
+            logFilePath: job.log_file || null,
+            error: orphanMsg
+          };
+        }
+        changed = true;
+      }
+    }
+  }
+
+  if (ledger.sessions && typeof ledger.sessions === 'object') {
+    for (const [sid, sess] of Object.entries(ledger.sessions)) {
+      if (!sess || (sess.state !== 'running' && sess.state !== 'queued')) continue;
+      const inLocalMap =
+        (sess.job_id && agyActiveJobs.has(sess.job_id)) || agyActiveJobs.has(sid);
+      if (inLocalMap) continue;
+
+      const alive = sess.pid ? isPidAlive(sess.pid) : false;
+      const startMs = Date.parse(sess.started_at || sess.created_at || 0);
+      const isStaleQueued =
+        sess.state === 'queued' &&
+        !sess.pid &&
+        (forceMarkNonLocal || !Number.isFinite(startMs) || now - startMs > 5000);
+
+      if ((sess.state === 'running' && !alive) || isStaleQueued) {
+        sess.state = 'failed';
+        sess.finished_at = sess.finished_at || nowIso;
+        sess.elapsed_s = computeLiveElapsedSeconds(sess);
+        sess.error =
+          sess.error ||
+          'Orphaned in-flight session: previous MCP server or agy process exited before completion.';
+        sess.last_updated_at = nowIso;
+        changed = true;
+      }
+    }
+  }
+
+  if (
+    typeof ledger.active_session_id === 'string' &&
+    (ledger.active_session_id.startsWith('job-') ||
+      ledger.active_session_id.startsWith('pending-'))
+  ) {
+    const mappedConv = ledger.jobs?.[ledger.active_session_id]?.conversation_id;
+    if (
+      mappedConv &&
+      !mappedConv.startsWith('job-') &&
+      !mappedConv.startsWith('pending-')
+    ) {
+      ledger.active_session_id = mappedConv;
+    } else {
+      const validSessionIds = Object.keys(ledger.sessions || {}).filter(
+        k => !k.startsWith('job-') && !k.startsWith('pending-')
+      );
+      ledger.active_session_id =
+        validSessionIds.length > 0 ? validSessionIds[validSessionIds.length - 1] : null;
+    }
+    changed = true;
+  }
+
+  if (changed && persistIfChanged) {
+    ledger.last_updated_at = nowIso;
+    writeJsonSafe(STATE_LEDGER_PATH, ledger);
+  }
+  return changed;
+}
+
 // Refresh quota rolling windows (5h & weekly) and expire old model locks
 function refreshQuotaState(ledger) {
   const now = Date.now();
@@ -485,6 +608,7 @@ function refreshQuotaState(ledger) {
   quotas.shared_weekly_window = wWeekly;
   quotas.per_model_locks = perModel;
   ledger.model_quotas = quotas;
+  reconcileOrphanedJobsAndSessions(ledger, { persistIfChanged: false });
   return ledger;
 }
 
@@ -898,7 +1022,12 @@ function persistJobAndSessionState(jobRecord, phase = 'start', provisionalSessio
     existing.last_updated_at = nowIso;
 
     ledger.sessions[sessionId] = existing;
-    if (phase === 'running' || phase === 'finish') {
+    if (
+      (phase === 'running' || phase === 'finish') &&
+      sessionId &&
+      !sessionId.startsWith('job-') &&
+      !sessionId.startsWith('pending-')
+    ) {
       ledger.active_session_id = sessionId;
     }
 
@@ -945,6 +1074,7 @@ function getAgyQueueSnapshot() {
   // Merge any persisted jobs from state-ledger.json if recentJobs is empty (e.g. across CLI invocations)
   if (recentJobs.length === 0) {
     const ledger = readJsonSafe(STATE_LEDGER_PATH);
+    reconcileOrphanedJobsAndSessions(ledger, { persistIfChanged: true });
     const persistedJobs = Object.values(ledger.jobs || {});
     for (let i = persistedJobs.length - 1; i >= 0 && recentJobs.length < 10; i--) {
       const pj = persistedJobs[i];
@@ -1072,6 +1202,7 @@ async function cancelAgyJob(targetJobId) {
 
   if (!jobEntry) {
     const ledger = readJsonSafe(STATE_LEDGER_PATH);
+    reconcileOrphanedJobsAndSessions(ledger, { persistIfChanged: true });
     const persisted = ledger.jobs?.[rawId];
     if (persisted) {
       return {
@@ -1165,6 +1296,7 @@ async function getAgyJobResult(targetJobId, waitMs = 0) {
       resolvedId = agyJobOrder[agyJobOrder.length - 1];
     } else {
       const ledger = readJsonSafe(STATE_LEDGER_PATH);
+      reconcileOrphanedJobsAndSessions(ledger, { persistIfChanged: true });
       const keys = Object.keys(ledger.jobs || {});
       resolvedId = keys.length > 0 ? keys[keys.length - 1] : rawId;
     }
@@ -1198,6 +1330,7 @@ async function getAgyJobResult(targetJobId, waitMs = 0) {
   }
 
   const ledger = readJsonSafe(STATE_LEDGER_PATH);
+  reconcileOrphanedJobsAndSessions(ledger, { persistIfChanged: true });
   const persisted = ledger.jobs?.[resolvedId];
   if (persisted) {
     const stillActive = persisted.state === 'running' || persisted.state === 'queued';
@@ -1321,25 +1454,31 @@ async function executeAgyWithGovernor(options = {}) {
       }
     }
 
-    const elapsedS = Math.max(
-      0,
-      Math.round((Date.now() - (jobEntry.startedMs || jobEntry.queuedMs)) / 1000)
-    );
-    const finalState = res.cancelled
-      ? 'cancelled'
-      : res.timedOut
-      ? 'timed_out'
-      : res.ok
-      ? 'done'
-      : 'failed';
+    const wasAlreadyCancelled = jobRecord.state === 'cancelled' && Boolean(jobRecord.finished_at);
+    const elapsedS = wasAlreadyCancelled
+      ? jobRecord.elapsed_s
+      : Math.max(
+          0,
+          Math.round((Date.now() - (jobEntry.startedMs || jobEntry.queuedMs)) / 1000)
+        );
+    const finalState =
+      wasAlreadyCancelled || res.cancelled
+        ? 'cancelled'
+        : res.timedOut
+        ? 'timed_out'
+        : res.ok
+        ? 'done'
+        : 'failed';
 
     jobRecord.state = finalState;
-    jobRecord.finished_at = new Date().toISOString();
+    jobRecord.finished_at = wasAlreadyCancelled
+      ? jobRecord.finished_at
+      : new Date().toISOString();
     jobRecord.elapsed_s = elapsedS;
     jobRecord.model = res.modelUsed || jobRecord.model;
     jobRecord.conversation_id = res.conversationId || provisionalSessionId;
     jobRecord.log_file = res.logFilePath || jobRecord.log_file || null;
-    jobRecord.error = res.error || null;
+    jobRecord.error = res.error || jobRecord.error || null;
 
     const enrichedRes = {
       ...res,
@@ -2414,8 +2553,15 @@ async function executeAgyWithGovernorUnqueued({
 
       return {
         ok: false,
+        cancelled: false,
+        timedOut: false,
         modelUsed: currentModel,
         stepDownReason,
+        conversationId: conversationId || jobId || null,
+        responseText: '',
+        deniedActions: [],
+        responseEmpty: true,
+        governorAlerts: [],
         error: `Gemini quota exhausted on ${currentModel} (${attemptResult.abortedFor429.matched}). Locked until ${attemptResult.abortedFor429.lockedUntilIso}.`,
         rawStderr: attemptResult.stderr
       };
@@ -2597,11 +2743,21 @@ async function checkAndCompactSessionIfNeeded(conversationId, cwd = WORKSPACE_RO
 
   const res = await executeAgyWithGovernor({
     prompt: withShellRules(compactionPrompt),
+    rawPrompt: compactionPrompt,
     requestedModel: 'gemini-3.8-flash-medium',
     mode: 'plan',
     conversationId,
     cwd
   });
+
+  if (!res.ok || res.asyncPending) {
+    logStderr(
+      `Automatic context compaction for ${conversationId} did not finish synchronously (ok=${res.ok}, asyncPending=${Boolean(
+        res.asyncPending
+      )}). Continuing without compaction replacement.`
+    );
+    return { compacted: false, conversationId, handoffSummary: null };
+  }
 
   const summary =
     res.responseText || 'Prior session compacted due to exceeding 80% context ceiling.';
@@ -3355,6 +3511,7 @@ async function handleToolCall(name, args = {}) {
     }
     const matrix = readJsonSafe(MODEL_MATRIX_PATH);
     const ledger = refreshQuotaState(readJsonSafe(STATE_LEDGER_PATH));
+    reconcileOrphanedJobsAndSessions(ledger, { persistIfChanged: true });
     const ideSync = readJsonSafe(IDE_SYNC_PATH);
     const gitCheck = checkAndFixGitWorktreeConfig(cwd, false);
     const autoDetectedEnv = detectWorkspaceEnvironment(cwd);
@@ -3673,9 +3830,64 @@ async function handleToolCall(name, args = {}) {
   }
 
   if (name === 'agy_session_followup') {
-    const ledger = readJsonSafe(STATE_LEDGER_PATH);
+    const ledger = refreshQuotaState(readJsonSafe(STATE_LEDGER_PATH));
+    reconcileOrphanedJobsAndSessions(ledger, { persistIfChanged: true });
     const isLatest = args.conversation_id === 'latest';
-    const targetConvId = isLatest ? ledger.active_session_id : args.conversation_id;
+    let targetConvId = isLatest
+      ? ledger.active_session_id
+      : String(args.conversation_id || '').trim();
+
+    if (targetConvId && targetConvId.startsWith('job-')) {
+      const jobInfo = agyActiveJobs.get(targetConvId)?.jobRecord || ledger.jobs?.[targetConvId];
+      if (jobInfo) {
+        if (jobInfo.state === 'running' || jobInfo.state === 'queued') {
+          return {
+            isError: true,
+            content: [
+              {
+                type: 'text',
+                text: `Error: Job '${targetConvId}' is still ${jobInfo.state} and has not produced a completed session conversation_id yet. Call \`agy_job_result\` with \`{"job_id": "${targetConvId}"}\` to check or wait for its output, or \`agy_cancel\` to abort it.${buildTelemetryFooter(
+                  jobInfo.model,
+                  targetConvId
+                )}`
+              }
+            ]
+          };
+        }
+        if (
+          jobInfo.conversation_id &&
+          !jobInfo.conversation_id.startsWith('job-') &&
+          !jobInfo.conversation_id.startsWith('pending-')
+        ) {
+          targetConvId = jobInfo.conversation_id;
+        } else {
+          return {
+            isError: true,
+            content: [
+              {
+                type: 'text',
+                text: `Error: Job '${targetConvId}' ended in state '${jobInfo.state}' without establishing a session conversation_id (${
+                  jobInfo.error || 'no session created'
+                }). Inspect with \`agy_job_result\` or launch a new call.${buildTelemetryFooter(
+                  jobInfo.model,
+                  targetConvId
+                )}`
+              }
+            ]
+          };
+        }
+      } else {
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text',
+              text: `Error: '${targetConvId}' looks like a job_id rather than a session conversation_id, and no matching job was found. Use \`agy_status\` to check active sessions and jobs.${buildTelemetryFooter()}`
+            }
+          ]
+        };
+      }
+    }
 
     let effectiveConvId = targetConvId;
     let effectivePrompt = args.prompt;
@@ -4651,7 +4863,7 @@ async function handleRpcRequest(msg) {
           },
           serverInfo: {
             name: 'agy-subagent-governor',
-            version: '1.2.0'
+            version: '1.3.0'
           },
           instructions: MCP_SERVER_INSTRUCTIONS
         }
@@ -4791,6 +5003,8 @@ module.exports = {
   getAgyQueueSnapshot,
   getAgyJobResult,
   cancelAgyJob,
+  reconcileOrphanedJobsAndSessions,
+  isPidAlive,
   extractPromptPreview,
   validateDisjointSwarmPartitions,
   getLocalGpuConfig,
@@ -4889,6 +5103,16 @@ if (require.main === module) {
       );
     }
 
+    try {
+      const startupLedger = readJsonSafe(STATE_LEDGER_PATH);
+      reconcileOrphanedJobsAndSessions(startupLedger, {
+        persistIfChanged: true,
+        forceMarkNonLocal: true
+      });
+    } catch (err) {
+      logStderr(`Startup ledger reconciliation warning: ${err.message}`);
+    }
+
     runModelDiscovery().catch(err => logStderr(`Startup discovery error: ${err.message}`));
     const discoveryInterval = setInterval(() => {
       runModelDiscovery().catch(err => logStderr(`24h discovery error: ${err.message}`));
@@ -4898,7 +5122,7 @@ if (require.main === module) {
     process.stdin.on('data', onStdinData);
 
     logStderr(
-      `Antigravity Subagent Governor MCP Server v1.2.0 started and listening on stdio (agy concurrency ${AGY_MAX_CONCURRENCY}, ${AGY_READONLY_COMMAND_ALLOWLIST.length} allow-listed read-only commands).`
+      `Antigravity Subagent Governor MCP Server v1.3.0 started and listening on stdio (agy concurrency ${AGY_MAX_CONCURRENCY}, ${AGY_READONLY_COMMAND_ALLOWLIST.length} allow-listed read-only commands).`
     );
   }
 } // require.main === module
