@@ -133,9 +133,11 @@ async function runOfflineChecks() {
   assert(governor.AGY_MAX_CONCURRENCY === 1, 'agy process concurrency is fixed at 1');
   assert(
     Array.isArray(governor.SAFE_READONLY_MCP_TOOLS) &&
-      governor.SAFE_READONLY_MCP_TOOLS.length === 4 &&
-      !governor.SAFE_READONLY_MCP_TOOLS.includes('agy_delegate_edit'),
-    'SAFE_READONLY_MCP_TOOLS contains only the 4 read-only tools and never agy_delegate_edit'
+      governor.SAFE_READONLY_MCP_TOOLS.length === 5 &&
+      governor.SAFE_READONLY_MCP_TOOLS.includes('agy_job_result') &&
+      !governor.SAFE_READONLY_MCP_TOOLS.includes('agy_delegate_edit') &&
+      !governor.SAFE_READONLY_MCP_TOOLS.includes('agy_cancel'),
+    'SAFE_READONLY_MCP_TOOLS contains only the 5 read-only tools (including agy_job_result) and never agy_delegate_edit or agy_cancel'
   );
   assert(
     typeof governor.SCOUT_SYSTEM_PROMPT === 'string' &&
@@ -411,6 +413,34 @@ async function runSmokeTest() {
   console.log('=== Starting spillway-mcp Sandboxed Smoke Test ===\n');
 
   const tempRuntimeWs = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-smoke-runtime-'));
+  const mockAgyScript = path.join(tempRuntimeWs, 'mock-agy.js');
+  fs.writeFileSync(
+    mockAgyScript,
+    [
+      `'use strict';`,
+      `const fs = require('fs');`,
+      `const args = process.argv.slice(2);`,
+      `const pIdx = args.indexOf('-p');`,
+      `const prompt = pIdx !== -1 ? String(args[pIdx + 1] || '') : '';`,
+      `const logIdx = args.indexOf('--log-file');`,
+      `const logFile = logIdx !== -1 ? args[logIdx + 1] : null;`,
+      `if (logFile) { try { fs.writeFileSync(logFile, '[mock-agy] started pid=' + process.pid + '\\n', 'utf8'); } catch (_) {} }`,
+      `let delayMs = 50;`,
+      `if (prompt.includes('MOCK_DELAY_800MS')) delayMs = 800;`,
+      `if (prompt.includes('MOCK_DELAY_15000MS')) delayMs = 15000;`,
+      `setTimeout(() => {`,
+      `  process.stdout.write(JSON.stringify({`,
+      `    conversation_id: 'conv-mock-' + Date.now(),`,
+      `    response: 'MOCK_AGY_COMPLETE_ANSWER_OK: Analyzed PKHeX trees cleanly.',`,
+      `    denied_actions: [],`,
+      `    usage: { total_tokens: 4200 }`,
+      `  }) + '\\n');`,
+      `  process.exit(0);`,
+      `}, delayMs);`
+    ].join('\n'),
+    'utf8'
+  );
+  process.env.AGY_BIN_PATH = mockAgyScript;
   try {
     await runOfflineChecks();
     await runSafeguardChecks();
@@ -419,6 +449,7 @@ async function runSmokeTest() {
       cwd: tempRuntimeWs,
       env: {
         ...process.env,
+        AGY_BIN_PATH: mockAgyScript,
         AGY_CONFIG_DIR: SANDBOX_CONFIG_DIR,
         AGY_WORKSPACE_ROOT: tempRuntimeWs
       },
@@ -492,12 +523,22 @@ async function runSmokeTest() {
       console.log('\n2. Testing `tools/list`...');
       const listRes = await sendRpc('tools/list');
       const toolNames = listRes.result.tools.map(t => t.name);
-      assert(toolNames.length === 9, `9 MCP tools exposed (got ${toolNames.length})`);
+      assert(toolNames.length === 11, `11 MCP tools exposed (got ${toolNames.length})`);
       assert(
         toolNames.includes('local_file_scout') &&
           toolNames.includes('local_exec_and_triage') &&
-          toolNames.includes('local_draft_leaf_code'),
-        'tools/list exposes local_file_scout, local_exec_and_triage, and local_draft_leaf_code'
+          toolNames.includes('local_draft_leaf_code') &&
+          toolNames.includes('agy_job_result') &&
+          toolNames.includes('agy_cancel'),
+        'tools/list exposes Tier 3 Local GPU tools plus agy_job_result and agy_cancel'
+      );
+      const researchToolDef = listRes.result.tools.find(t => t.name === 'agy_delegate_research');
+      const swarmToolDef = listRes.result.tools.find(t => t.name === 'agy_spawn_swarm');
+      assert(
+        researchToolDef?.description.includes('serialized') &&
+          researchToolDef?.description.includes('agy_job_result') &&
+          swarmToolDef?.description.includes('sequentially'),
+        'tool descriptions document serialization, ~8-min prompt splitting, and agy_job_result'
       );
 
       // 2b. Test local_exec_and_triage short-circuit, command-chaining block, and local_file_scout guardrails
@@ -565,6 +606,124 @@ async function runSmokeTest() {
         }
       });
       assert(Boolean(collisionRes.result.isError), 'collision check blocks overlapping swarm paths');
+
+      // 5. Test Async Job Mode, Session-at-Start Registration, agy_job_result, agy_cancel & Hard Watchdog
+      console.log('\n5. Testing Async Job Mode, Session-at-Start, `agy_job_result`, `agy_cancel` & Hard Watchdog...');
+      const asyncStartRes = await sendRpc('tools/call', {
+        name: 'agy_delegate_research',
+        arguments: {
+          tier: 'flash-medium',
+          prompt: 'MOCK_DELAY_800MS Inspect PKHeX slot storage across source trees',
+          soft_timeout_ms: 150
+        }
+      });
+      const asyncStartText = asyncStartRes.result.content[0].text;
+      const jobMatch = asyncStartText.match(/still running, job (job-[a-z0-9-]+), started ([^,]+), elapsed (\d+)s; fetch with agy_job_result \1/);
+      const asyncJobId = jobMatch ? jobMatch[1] : null;
+      assert(
+        !asyncStartRes.result.isError && Boolean(asyncJobId),
+        `5a. Soft timeout returns normal non-error result with job ID (${asyncJobId}) before child finishes`
+      );
+
+      // Check agy_status while the job is still running in the background
+      const inFlightStatusRes = await sendRpc('tools/call', {
+        name: 'agy_status',
+        arguments: { refresh_models: false }
+      });
+      const inFlightBody = responseBody(inFlightStatusRes.result.content[0].text);
+      const inFlightJson = JSON.parse(inFlightBody.replace(/^###[^\n]*\n```json\n/, '').replace(/\n```$/, ''));
+      const activeJob = inFlightJson.agy_process_queue?.active_job;
+      const inFlightSession = inFlightJson.sessions?.[asyncJobId];
+      assert(
+        activeJob &&
+          activeJob.job_id === asyncJobId &&
+          activeJob.state === 'running' &&
+          activeJob.tier === 'flash-medium' &&
+          activeJob.prompt_preview.startsWith('MOCK_DELAY_800MS Inspect PKHeX'),
+        '5b. agy_status.agy_process_queue.active_job names the running job_id, state, tier, started_at, elapsed_s, and prompt_preview'
+      );
+      assert(
+        inFlightSession &&
+          inFlightSession.state === 'running' &&
+          inFlightSession.job_id === asyncJobId &&
+          inFlightSession.prompt_preview.startsWith('MOCK_DELAY_800MS Inspect PKHeX'),
+        '5c. Session is registered in ledger.sessions AT START with state="running", started_at, elapsed_s, tier, and prompt_preview'
+      );
+
+      // Fetch completed job result via agy_job_result (waiting up to 3000ms for the 800ms mock child to finish)
+      const jobFetchRes = await sendRpc('tools/call', {
+        name: 'agy_job_result',
+        arguments: {
+          job_id: asyncJobId,
+          wait_ms: 3000
+        }
+      });
+      const jobFetchText = jobFetchRes.result.content[0].text;
+      assert(
+        !jobFetchRes.result.isError &&
+          jobFetchText.includes('MOCK_AGY_COMPLETE_ANSWER_OK: Analyzed PKHeX trees cleanly.') &&
+          jobFetchText.includes('`done`'),
+        '5d. agy_job_result retrieves the full stored response once the background child completes'
+      );
+
+      // Test agy_cancel on a stuck/long job
+      const cancelTargetRes = await sendRpc('tools/call', {
+        name: 'agy_delegate_research',
+        arguments: {
+          tier: 'flash-low',
+          prompt: 'MOCK_DELAY_15000MS Long running job to cancel',
+          soft_timeout_ms: 120
+        }
+      });
+      const cancelTargetMatch = cancelTargetRes.result.content[0].text.match(/still running, job (job-[a-z0-9-]+)/);
+      const cancelJobId = cancelTargetMatch ? cancelTargetMatch[1] : null;
+      assert(Boolean(cancelJobId), `5e. Launched long-running job (${cancelJobId}) for cancellation test`);
+
+      const cancelCallRes = await sendRpc('tools/call', {
+        name: 'agy_cancel',
+        arguments: { job_id: cancelJobId }
+      });
+      const cancelCallText = cancelCallRes.result.content[0].text;
+      assert(
+        !cancelCallRes.result.isError && cancelCallText.includes('"status": "cancelled"'),
+        '5f. agy_cancel terminates the running child process tree and marks the job cancelled'
+      );
+
+      // Verify queue is freed and agy_job_result reports cancelled
+      const afterCancelJobRes = await sendRpc('tools/call', {
+        name: 'agy_job_result',
+        arguments: { job_id: cancelJobId }
+      });
+      assert(
+        Boolean(afterCancelJobRes.result.isError) &&
+          afterCancelJobRes.result.content[0].text.includes('cancelled by caller via agy_cancel'),
+        '5g. agy_job_result reports cancelled state after agy_cancel'
+      );
+
+      // Test Hard Watchdog (AGY_RUN_MAX_MS / hardTimeoutMs)
+      const watchdogRes = await governor.executeAgyWithGovernor({
+        prompt: 'MOCK_DELAY_15000MS Hung process for watchdog test',
+        rawPrompt: 'MOCK_DELAY_15000MS Hung process for watchdog test',
+        requestedModel: 'flash-low',
+        mode: 'plan',
+        cwd: tempRuntimeWs,
+        softTimeoutMs: 5000,
+        hardTimeoutMs: 250
+      });
+      assert(
+        watchdogRes.ok === false &&
+          watchdogRes.timedOut === true &&
+          watchdogRes.state === 'timed_out' &&
+          watchdogRes.error.includes(watchdogRes.jobId) &&
+          Boolean(watchdogRes.logFilePath) &&
+          fs.existsSync(watchdogRes.logFilePath),
+        `5h. Hard watchdog kills hung child after hardTimeoutMs, names job (${watchdogRes.jobId}) and preserves log file on disk`
+      );
+      try {
+        if (watchdogRes.logFilePath && fs.existsSync(watchdogRes.logFilePath)) {
+          fs.unlinkSync(watchdogRes.logFilePath);
+        }
+      } catch (_) {}
 
       console.log(`\n=== Smoke Test Complete. Zero stdout framing errors: ${framingErrors === 0} ===`);
       assert(framingErrors === 0, 'zero stdout framing errors');

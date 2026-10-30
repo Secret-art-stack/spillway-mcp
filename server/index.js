@@ -87,6 +87,14 @@ const AGY_READONLY_COMMAND_ALLOWLIST = Object.freeze(
 // state can corrupt), so every agy run goes through a single in-process queue.
 const AGY_MAX_CONCURRENCY = 1;
 
+// Soft budget for async job handoff (540s = 9 min, safely below .mcp.json's 600s client timeout).
+// Override via AGY_SOFT_TIMEOUT_MS env var or per-call softTimeoutMs.
+const DEFAULT_AGY_SOFT_TIMEOUT_MS = 540000;
+
+// Hard watchdog ceiling (1800s = 30 min, well above the soft budget) to reap genuinely hung agy processes.
+// Override via AGY_RUN_MAX_MS env var or per-call hardTimeoutMs.
+const DEFAULT_AGY_RUN_MAX_MS = 1800000;
+
 // The local consumer GPU can only keep ONE LLM loaded in VRAM at a time
 // without PCIe system RAM thrashing. All local GPU requests serialize here.
 const LOCAL_GPU_MAX_CONCURRENCY = 1;
@@ -580,9 +588,12 @@ function resolveModelSlug(requestedTierOrSlug, matrix, ledger) {
 async function runModelDiscovery() {
   const agyBin = resolveAgyBinary();
   const matrix = readJsonSafe(MODEL_MATRIX_PATH);
+  const isJsScript = /\.m?js$/i.test(agyBin);
+  const execCmd = isJsScript ? process.execPath : agyBin;
+  const execArgs = isJsScript ? [agyBin, 'models'] : ['models'];
 
   return new Promise(resolve => {
-    execFile(agyBin, ['models'], { timeout: 30000, windowsHide: true }, (err, stdout, stderr) => {
+    execFile(execCmd, execArgs, { timeout: 30000, windowsHide: true }, (err, stdout, stderr) => {
       if (err) {
         logStderr(`Model discovery error: ${err.message}`);
         return resolve({
@@ -753,19 +764,278 @@ function formatGovernorNotices(res, extraNotes = []) {
 }
 
 // ----------------------------------------------------------------------------
-// Single in-process queue for agy executions (AGY_MAX_CONCURRENCY = 1).
+// Single in-process queue for agy executions (AGY_MAX_CONCURRENCY = 1) +
+// Async Job Registry, Session-at-Start Registration, Soft Timeout & Cancellation.
 // Two concurrent `agy -p` processes interfere: one exits 1 and the shared
 // permission state in ~/.gemini can corrupt. Every caller, including
 // agy_spawn_swarm, goes through executeAgyWithGovernor, which serializes here.
 // ----------------------------------------------------------------------------
 let agyQueueTail = Promise.resolve();
 const agyQueueState = { max_concurrency: AGY_MAX_CONCURRENCY, running: 0, waiting: 0, completed: 0 };
+const agyActiveJobs = new Map();
+const agyJobOrder = [];
+const MAX_STORED_JOBS = 50;
 
-function enqueueAgyRun(taskFn) {
+function getAgySoftTimeoutMs(overrideMs) {
+  if (typeof overrideMs === 'number' && Number.isFinite(overrideMs) && overrideMs > 0) {
+    return overrideMs;
+  }
+  const envVal = Number(process.env.AGY_SOFT_TIMEOUT_MS);
+  return Number.isFinite(envVal) && envVal > 0 ? envVal : DEFAULT_AGY_SOFT_TIMEOUT_MS;
+}
+
+function getAgyRunMaxMs(overrideMs) {
+  if (typeof overrideMs === 'number' && Number.isFinite(overrideMs) && overrideMs > 0) {
+    return overrideMs;
+  }
+  const envVal = Number(process.env.AGY_RUN_MAX_MS);
+  return Number.isFinite(envVal) && envVal > 0 ? envVal : DEFAULT_AGY_RUN_MAX_MS;
+}
+
+function extractPromptPreview(prompt, rawUserPrompt) {
+  const source = typeof rawUserPrompt === 'string' && rawUserPrompt.trim() ? rawUserPrompt : String(prompt || '');
+  const stripped = source
+    .replace(/^\[READ-ONLY RESEARCH MODE:[^\]]*\]\s*/i, '')
+    .replace(/\[SWARM SUBAGENT ID:[^\]]*\]\s*/gi, '')
+    .replace(/\[STRICT PATH PARTITION LOCK:[^\]]*\]\s*/gi, '')
+    .replace(/\[HEADLESS SHELL RULES[\s\S]*?\[END HEADLESS SHELL RULES\]\s*/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return stripped.length > 120 ? `${stripped.slice(0, 117)}...` : stripped;
+}
+
+function computeLiveElapsedSeconds(jobOrSession) {
+  if (!jobOrSession) return 0;
+  if (
+    typeof jobOrSession.elapsed_s === 'number' &&
+    jobOrSession.state &&
+    jobOrSession.state !== 'running' &&
+    jobOrSession.state !== 'queued'
+  ) {
+    return jobOrSession.elapsed_s;
+  }
+  const startIso = jobOrSession.started_at || jobOrSession.queued_at || jobOrSession.created_at;
+  if (!startIso) return 0;
+  const parsed = Date.parse(startIso);
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.max(0, Math.round((Date.now() - parsed) / 1000));
+}
+
+function serializeJobSummary(jobRecord, includeResult = false) {
+  if (!jobRecord) return null;
+  const elapsedS = computeLiveElapsedSeconds(jobRecord);
+  const summary = {
+    job_id: jobRecord.job_id,
+    state: jobRecord.state,
+    tier: jobRecord.tier,
+    model: jobRecord.model,
+    mode: jobRecord.mode,
+    cwd: jobRecord.cwd,
+    prompt_preview: jobRecord.prompt_preview,
+    queued_at: jobRecord.queued_at,
+    started_at: jobRecord.started_at,
+    finished_at: jobRecord.finished_at,
+    elapsed_s: elapsedS,
+    pid: jobRecord.pid || null,
+    log_file: jobRecord.log_file || null,
+    conversation_id: jobRecord.conversation_id || null,
+    error: jobRecord.error || null
+  };
+  if (includeResult && jobRecord.result) {
+    summary.result = jobRecord.result;
+  }
+  return summary;
+}
+
+// Persist job state and register/update the session in state-ledger.json at start and finish
+function persistJobAndSessionState(jobRecord, phase = 'start', provisionalSessionId = null) {
+  try {
+    const matrix = readJsonSafe(MODEL_MATRIX_PATH);
+    const ledger = refreshQuotaState(readJsonSafe(STATE_LEDGER_PATH));
+    if (!ledger.sessions || typeof ledger.sessions !== 'object') ledger.sessions = {};
+    if (!ledger.jobs || typeof ledger.jobs !== 'object') ledger.jobs = {};
+
+    const sessionId = jobRecord.conversation_id || provisionalSessionId || jobRecord.job_id;
+    const modelSlug = jobRecord.model || 'gemini-3.8-flash-medium';
+    const modelMeta = matrix.models?.[modelSlug] || { context_ceiling_tokens: 1000000 };
+    const maxContextTokens = modelMeta.context_ceiling_tokens || 1000000;
+    const nowIso = new Date().toISOString();
+
+    if (
+      phase === 'finish' &&
+      provisionalSessionId &&
+      provisionalSessionId !== sessionId &&
+      ledger.sessions[provisionalSessionId]
+    ) {
+      delete ledger.sessions[provisionalSessionId];
+    }
+
+    const existing = ledger.sessions[sessionId] || {
+      conversation_id: sessionId,
+      cwd: jobRecord.cwd || WORKSPACE_ROOT,
+      model: modelSlug,
+      estimated_tokens_used: 0,
+      max_context_tokens: maxContextTokens,
+      turns: 0,
+      created_at: jobRecord.queued_at || nowIso,
+      last_updated_at: nowIso,
+      compacted_from: null
+    };
+
+    existing.conversation_id = sessionId;
+    existing.job_id = jobRecord.job_id;
+    existing.state = jobRecord.state;
+    existing.tier = jobRecord.tier;
+    existing.model = modelSlug;
+    existing.mode = jobRecord.mode;
+    existing.prompt_preview = jobRecord.prompt_preview;
+    existing.started_at = jobRecord.started_at || jobRecord.queued_at || existing.created_at;
+    existing.finished_at = jobRecord.finished_at || null;
+    existing.elapsed_s = computeLiveElapsedSeconds(jobRecord);
+    existing.pid = jobRecord.pid || null;
+    existing.log_file = jobRecord.log_file || null;
+    existing.error = jobRecord.error || null;
+    existing.last_updated_at = nowIso;
+
+    ledger.sessions[sessionId] = existing;
+    if (phase === 'running' || phase === 'finish') {
+      ledger.active_session_id = sessionId;
+    }
+
+    ledger.jobs[jobRecord.job_id] = serializeJobSummary(jobRecord, true);
+
+    const jobKeys = Object.keys(ledger.jobs);
+    if (jobKeys.length > MAX_STORED_JOBS) {
+      const removable = jobKeys.filter(
+        k => ledger.jobs[k]?.state !== 'running' && ledger.jobs[k]?.state !== 'queued'
+      );
+      while (Object.keys(ledger.jobs).length > MAX_STORED_JOBS && removable.length > 0) {
+        const oldestKey = removable.shift();
+        delete ledger.jobs[oldestKey];
+      }
+    }
+
+    ledger.last_updated_at = nowIso;
+    writeJsonSafe(STATE_LEDGER_PATH, ledger);
+  } catch (err) {
+    logStderr(`Failed persisting job/session state for ${jobRecord?.job_id}: ${err.message}`);
+  }
+}
+
+function getAgyQueueSnapshot() {
+  let activeJob = null;
+  const waitingJobs = [];
+  const recentJobs = [];
+
+  for (let i = agyJobOrder.length - 1; i >= 0; i--) {
+    const jId = agyJobOrder[i];
+    const entry = agyActiveJobs.get(jId);
+    if (!entry) continue;
+    const summary = serializeJobSummary(entry.jobRecord, false);
+    if (entry.jobRecord.state === 'running' && !activeJob) {
+      activeJob = summary;
+    } else if (entry.jobRecord.state === 'queued') {
+      waitingJobs.unshift(summary);
+    }
+    if (recentJobs.length < 10) {
+      recentJobs.push(summary);
+    }
+  }
+
+  // Merge any persisted jobs from state-ledger.json if recentJobs is empty (e.g. across CLI invocations)
+  if (recentJobs.length === 0) {
+    const ledger = readJsonSafe(STATE_LEDGER_PATH);
+    const persistedJobs = Object.values(ledger.jobs || {});
+    for (let i = persistedJobs.length - 1; i >= 0 && recentJobs.length < 10; i--) {
+      const pj = persistedJobs[i];
+      const summary = serializeJobSummary(pj, false);
+      if (pj.state === 'running' && !activeJob) activeJob = summary;
+      else if (pj.state === 'queued') waitingJobs.unshift(summary);
+      recentJobs.push(summary);
+    }
+  }
+
+  return {
+    max_concurrency: AGY_MAX_CONCURRENCY,
+    running: agyQueueState.running,
+    waiting: agyQueueState.waiting,
+    completed: agyQueueState.completed,
+    soft_timeout_ms: getAgySoftTimeoutMs(),
+    hard_watchdog_ms: getAgyRunMaxMs(),
+    active_job: activeJob,
+    waiting_jobs: waitingJobs,
+    recent_jobs: recentJobs
+  };
+}
+
+function formatAsyncPendingMessage(jobRecord, softTimeoutMs) {
+  const startIso = jobRecord.started_at || jobRecord.queued_at;
+  const elapsedS = computeLiveElapsedSeconds(jobRecord);
+  const headline = `still running, job ${jobRecord.job_id}, started ${startIso}, elapsed ${elapsedS}s; fetch with agy_job_result ${jobRecord.job_id}`;
+  const budgetNote = softTimeoutMs
+    ? `> [Governor Async Job Mode: Soft budget (${Math.round(
+        softTimeoutMs / 1000
+      )}s) reached before child exit — returning early with job ID so MCP stdio transport stays alive.]\n\n`
+    : '';
+  return [
+    `${budgetNote}${headline}`,
+    '',
+    `- **Job ID:** \`${jobRecord.job_id}\``,
+    `- **State:** \`${jobRecord.state}\``,
+    `- **Tier / Model:** \`${jobRecord.tier}\` (\`${jobRecord.model}\`)`,
+    `- **Started At:** \`${startIso}\``,
+    `- **Elapsed:** \`${elapsedS}s\``,
+    `- **Prompt Preview:** \`${jobRecord.prompt_preview}\``,
+    `- **Fetch Result:** Call \`agy_job_result\` with \`{"job_id": "${jobRecord.job_id}"}\` (or \`{"job_id": "${jobRecord.job_id}", "wait_ms": 30000}\`).`,
+    `- **Cancel Run:** Call \`agy_cancel\` with \`{"job_id": "${jobRecord.job_id}"}\` to terminate and free the queue.`
+  ].join('\n');
+}
+
+function enqueueAgyRun(jobEntry, taskFn) {
   agyQueueState.waiting += 1;
   const run = agyQueueTail.then(async () => {
     agyQueueState.waiting -= 1;
+    if (jobEntry?.cancelled) {
+      agyQueueState.completed += 1;
+      const cancelMsg =
+        jobEntry.cancelReason || `Job ${jobEntry.jobRecord.job_id} was cancelled while queued.`;
+      jobEntry.jobRecord.state = 'cancelled';
+      jobEntry.jobRecord.finished_at = new Date().toISOString();
+      jobEntry.jobRecord.elapsed_s = computeLiveElapsedSeconds(jobEntry.jobRecord);
+      jobEntry.jobRecord.error = cancelMsg;
+      const cancelledRes = {
+        ok: false,
+        cancelled: true,
+        timedOut: false,
+        jobId: jobEntry.jobRecord.job_id,
+        state: 'cancelled',
+        startedAt: jobEntry.jobRecord.queued_at,
+        elapsedSeconds: jobEntry.jobRecord.elapsed_s,
+        modelUsed: jobEntry.jobRecord.model,
+        stepDownReason: null,
+        conversationId: jobEntry.jobRecord.conversation_id,
+        responseText: '',
+        deniedActions: [],
+        responseEmpty: true,
+        governorAlerts: [],
+        error: cancelMsg
+      };
+      jobEntry.jobRecord.result = cancelledRes;
+      persistJobAndSessionState(
+        jobEntry.jobRecord,
+        'finish',
+        jobEntry.provisionalSessionId
+      );
+      return cancelledRes;
+    }
+
     agyQueueState.running += 1;
+    if (jobEntry) {
+      jobEntry.startedMs = Date.now();
+      jobEntry.jobRecord.state = 'running';
+      jobEntry.jobRecord.started_at = new Date(jobEntry.startedMs).toISOString();
+      persistJobAndSessionState(jobEntry.jobRecord, 'running', jobEntry.provisionalSessionId);
+    }
     try {
       return await taskFn();
     } finally {
@@ -778,14 +1048,350 @@ function enqueueAgyRun(taskFn) {
   return run;
 }
 
-async function executeAgyWithGovernor(options) {
+async function cancelAgyJob(targetJobId) {
+  const rawId = String(targetJobId || '').trim();
+  if (!rawId) {
+    return { ok: false, job_id: null, status: 'invalid', message: 'job_id is required.' };
+  }
+
+  let jobEntry = null;
+  if (rawId === 'active' || rawId === 'current' || rawId === 'latest') {
+    for (let i = agyJobOrder.length - 1; i >= 0; i--) {
+      const candidate = agyActiveJobs.get(agyJobOrder[i]);
+      if (
+        candidate &&
+        (candidate.jobRecord.state === 'running' || candidate.jobRecord.state === 'queued')
+      ) {
+        jobEntry = candidate;
+        break;
+      }
+    }
+  } else {
+    jobEntry = agyActiveJobs.get(rawId) || null;
+  }
+
+  if (!jobEntry) {
+    const ledger = readJsonSafe(STATE_LEDGER_PATH);
+    const persisted = ledger.jobs?.[rawId];
+    if (persisted) {
+      return {
+        ok: false,
+        job_id: rawId,
+        status: 'already_finished',
+        state: persisted.state,
+        message: `Job ${rawId} is already in state '${persisted.state}' and cannot be cancelled.`
+      };
+    }
+    return {
+      ok: false,
+      job_id: rawId,
+      status: 'not_found',
+      message: `No active or queued job found matching '${rawId}'.`
+    };
+  }
+
+  const { jobRecord } = jobEntry;
+  const prevState = jobRecord.state;
+  if (prevState !== 'running' && prevState !== 'queued') {
+    return {
+      ok: false,
+      job_id: jobRecord.job_id,
+      status: 'already_finished',
+      state: prevState,
+      message: `Job ${jobRecord.job_id} already finished with state '${prevState}'.`
+    };
+  }
+
+  const elapsedS = computeLiveElapsedSeconds(jobRecord);
+  const pid = jobRecord.pid || jobEntry.child?.pid || null;
+  jobEntry.cancelled = true;
+  jobEntry.cancelReason = `Job ${jobRecord.job_id} was cancelled by caller via agy_cancel after ${elapsedS}s (previous state: ${prevState}).`;
+  jobRecord.state = 'cancelled';
+  jobRecord.finished_at = new Date().toISOString();
+  jobRecord.elapsed_s = elapsedS;
+  jobRecord.error = jobEntry.cancelReason;
+  jobRecord.result = {
+    ok: false,
+    cancelled: true,
+    timedOut: false,
+    jobId: jobRecord.job_id,
+    state: 'cancelled',
+    startedAt: jobRecord.started_at || jobRecord.queued_at,
+    elapsedSeconds: elapsedS,
+    modelUsed: jobRecord.model,
+    stepDownReason: null,
+    conversationId: jobRecord.conversation_id,
+    responseText: '',
+    deniedActions: [],
+    responseEmpty: true,
+    governorAlerts: [],
+    logFilePath: jobRecord.log_file || null,
+    error: jobEntry.cancelReason
+  };
+
+  if (jobEntry.child) {
+    logStderr(
+      `Cancelling running agy job ${jobRecord.job_id} (PID ${pid}, elapsed ${elapsedS}s)...`
+    );
+    killProcessTree(jobEntry.child);
+  } else {
+    logStderr(`Cancelling queued agy job ${jobRecord.job_id}...`);
+  }
+
+  persistJobAndSessionState(jobRecord, 'finish', jobEntry.provisionalSessionId);
+
+  return {
+    ok: true,
+    job_id: jobRecord.job_id,
+    status: 'cancelled',
+    previous_state: prevState,
+    state: 'cancelled',
+    pid,
+    elapsed_s: elapsedS,
+    log_file: jobRecord.log_file || null,
+    message: jobEntry.cancelReason
+  };
+}
+
+async function getAgyJobResult(targetJobId, waitMs = 0) {
+  const rawId = String(targetJobId || '').trim();
+  if (!rawId) {
+    return { found: false, job_id: null, message: 'job_id is required.' };
+  }
+
+  let resolvedId = rawId;
+  if (rawId === 'latest') {
+    if (agyJobOrder.length > 0) {
+      resolvedId = agyJobOrder[agyJobOrder.length - 1];
+    } else {
+      const ledger = readJsonSafe(STATE_LEDGER_PATH);
+      const keys = Object.keys(ledger.jobs || {});
+      resolvedId = keys.length > 0 ? keys[keys.length - 1] : rawId;
+    }
+  }
+
+  const jobEntry = agyActiveJobs.get(resolvedId);
+  if (jobEntry) {
+    const isRunningOrQueued =
+      jobEntry.jobRecord.state === 'running' || jobEntry.jobRecord.state === 'queued';
+    if (isRunningOrQueued && typeof waitMs === 'number' && waitMs > 0) {
+      const effectiveWait = Math.min(waitMs, getAgySoftTimeoutMs());
+      let waitTimer = null;
+      await Promise.race([
+        jobEntry.completionPromise.catch(() => {}),
+        new Promise(resolve => {
+          waitTimer = setTimeout(resolve, effectiveWait);
+        })
+      ]);
+      if (waitTimer) clearTimeout(waitTimer);
+    }
+
+    const jr = jobEntry.jobRecord;
+    const stillActive = jr.state === 'running' || jr.state === 'queued';
+    return {
+      found: true,
+      job_id: jr.job_id,
+      stillRunning: stillActive,
+      jobRecord: serializeJobSummary(jr, true),
+      result: jr.result || null
+    };
+  }
+
+  const ledger = readJsonSafe(STATE_LEDGER_PATH);
+  const persisted = ledger.jobs?.[resolvedId];
+  if (persisted) {
+    const stillActive = persisted.state === 'running' || persisted.state === 'queued';
+    return {
+      found: true,
+      job_id: persisted.job_id || resolvedId,
+      stillRunning: stillActive,
+      jobRecord: serializeJobSummary(persisted, true),
+      result: persisted.result || null
+    };
+  }
+
+  return {
+    found: false,
+    job_id: resolvedId,
+    stillRunning: false,
+    jobRecord: null,
+    result: null,
+    message: `Unknown job_id '${resolvedId}'. Check agy_status for active_job and recent_jobs.`
+  };
+}
+
+async function executeAgyWithGovernor(options = {}) {
+  // Fast-fail permission-skipping guard before queueing
+  const skipPermsAllowed =
+    process.env.AGY_ALLOW_SKIP_PERMISSIONS === '1' &&
+    process.env.AGY_DENY_SKIP_PERMISSIONS !== '1';
+  if (options.mode === 'dangerously-skip-permissions' && !skipPermsAllowed) {
+    return {
+      ok: false,
+      modelUsed: null,
+      stepDownReason: null,
+      conversationId: options.conversationId || null,
+      responseText: '',
+      deniedActions: [],
+      responseEmpty: true,
+      governorAlerts: [],
+      error:
+        'refused: permission-skipping mode (--dangerously-skip-permissions / allow_shell: true) is disabled by default for workspace safety (or blocked by AGY_DENY_SKIP_PERMISSIONS=1). Use research mode, an edit without allow_shell, or local_exec_and_triage. Set AGY_ALLOW_SKIP_PERMISSIONS=1 in .mcp.json env to opt in.'
+    };
+  }
+
   const backlog = agyQueueState.running + agyQueueState.waiting;
   if (backlog > 0) {
     logStderr(
       `Queueing agy run behind ${backlog} other(s) (max concurrency ${AGY_MAX_CONCURRENCY}; concurrent agy processes interfere).`
     );
   }
-  return enqueueAgyRun(() => executeAgyWithGovernorUnqueued(options));
+
+  const matrix = readJsonSafe(MODEL_MATRIX_PATH);
+  const ledger = refreshQuotaState(readJsonSafe(STATE_LEDGER_PATH));
+  const { slug: initialModel } = resolveModelSlug(options.requestedModel, matrix, ledger);
+  const jobId = options.jobId || `job-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  const provisionalSessionId = options.conversationId || jobId;
+  const promptPreview = extractPromptPreview(options.prompt, options.rawPrompt);
+
+  const jobRecord = {
+    job_id: jobId,
+    state: 'queued',
+    tier: String(options.requestedModel || 'flash-medium'),
+    model: initialModel,
+    mode: options.mode || 'plan',
+    cwd: options.cwd || WORKSPACE_ROOT,
+    prompt_preview: promptPreview,
+    queued_at: nowIso,
+    started_at: null,
+    finished_at: null,
+    elapsed_s: 0,
+    pid: null,
+    log_file: null,
+    conversation_id: provisionalSessionId,
+    error: null,
+    result: null
+  };
+
+  const jobEntry = {
+    jobRecord,
+    provisionalSessionId,
+    child: null,
+    cancelled: false,
+    cancelReason: null,
+    queuedMs: nowMs,
+    startedMs: null,
+    completionPromise: null
+  };
+
+  agyActiveJobs.set(jobId, jobEntry);
+  agyJobOrder.push(jobId);
+  while (agyJobOrder.length > MAX_STORED_JOBS) {
+    const oldest = agyJobOrder.shift();
+    const oldEntry = agyActiveJobs.get(oldest);
+    if (
+      oldEntry &&
+      oldEntry.jobRecord.state !== 'running' &&
+      oldEntry.jobRecord.state !== 'queued'
+    ) {
+      agyActiveJobs.delete(oldest);
+    } else {
+      agyJobOrder.unshift(oldest);
+      break;
+    }
+  }
+
+  // Requirement #2: Register the session and job AT START (not at completion)
+  persistJobAndSessionState(jobRecord, 'start', provisionalSessionId);
+
+  const completionPromise = enqueueAgyRun(jobEntry, async () => {
+    const res = await executeAgyWithGovernorUnqueued({
+      ...options,
+      jobId,
+      jobEntry
+    });
+
+    if (typeof options.onComplete === 'function') {
+      try {
+        await options.onComplete(res);
+      } catch (hookErr) {
+        logStderr(`Post-completion hook error for ${jobId}: ${hookErr.message}`);
+      }
+    }
+
+    const elapsedS = Math.max(
+      0,
+      Math.round((Date.now() - (jobEntry.startedMs || jobEntry.queuedMs)) / 1000)
+    );
+    const finalState = res.cancelled
+      ? 'cancelled'
+      : res.timedOut
+      ? 'timed_out'
+      : res.ok
+      ? 'done'
+      : 'failed';
+
+    jobRecord.state = finalState;
+    jobRecord.finished_at = new Date().toISOString();
+    jobRecord.elapsed_s = elapsedS;
+    jobRecord.model = res.modelUsed || jobRecord.model;
+    jobRecord.conversation_id = res.conversationId || provisionalSessionId;
+    jobRecord.log_file = res.logFilePath || jobRecord.log_file || null;
+    jobRecord.error = res.error || null;
+
+    const enrichedRes = {
+      ...res,
+      jobId,
+      state: finalState,
+      startedAt: jobRecord.started_at || jobRecord.queued_at,
+      elapsedSeconds: elapsedS
+    };
+    jobRecord.result = enrichedRes;
+    persistJobAndSessionState(jobRecord, 'finish', provisionalSessionId);
+    return enrichedRes;
+  });
+
+  jobEntry.completionPromise = completionPromise;
+
+  // Requirement #1: Soft timeout budget so slow runs return a normal async job response
+  // before the client's 600s MCP timeout drops the stdio connection.
+  const softTimeoutMs = getAgySoftTimeoutMs(options.softTimeoutMs);
+  let softTimer = null;
+  const raceOutcome = await Promise.race([
+    completionPromise.then(res => ({ completed: true, res })),
+    new Promise(resolve => {
+      softTimer = setTimeout(() => resolve({ completed: false }), softTimeoutMs);
+    })
+  ]);
+  if (softTimer) clearTimeout(softTimer);
+
+  if (raceOutcome.completed) {
+    return raceOutcome.res;
+  }
+
+  const startIso = jobRecord.started_at || jobRecord.queued_at;
+  const elapsedS = computeLiveElapsedSeconds(jobRecord);
+  logStderr(
+    `[ASYNC JOB HANDOFF] Job ${jobId} still ${jobRecord.state} after soft budget (${softTimeoutMs}ms). Returning job handle to caller while child continues in background.`
+  );
+
+  return {
+    ok: true,
+    asyncPending: true,
+    jobId,
+    state: jobRecord.state,
+    startedAt: startIso,
+    elapsedSeconds: elapsedS,
+    modelUsed: jobRecord.model,
+    stepDownReason: null,
+    conversationId: jobRecord.conversation_id,
+    responseText: formatAsyncPendingMessage(jobRecord, softTimeoutMs),
+    deniedActions: [],
+    responseEmpty: false,
+    governorAlerts: []
+  };
 }
 
 // ============================================================================
@@ -1498,8 +2104,9 @@ function runSubprocessWithTreeKill({ command, cwd = WORKSPACE_ROOT, env = proces
   });
 }
 
-// Execute agy CLI with Reactive Cooldown Parser (Section 2D), Workspace Env Injection & Fallback Step-down.
-// Never call this directly: use executeAgyWithGovernor so runs are serialized.
+// Execute agy CLI with Reactive Cooldown Parser (Section 2D), Hard Watchdog, Cancellation,
+// Workspace Env Injection & Fallback Step-down.
+// Never call this directly: use executeAgyWithGovernor so runs are serialized and tracked.
 async function executeAgyWithGovernorUnqueued({
   prompt,
   requestedModel,
@@ -1507,7 +2114,10 @@ async function executeAgyWithGovernorUnqueued({
   conversationId = null,
   continueLatest = false,
   cwd = WORKSPACE_ROOT,
-  allowFallbackRetry = true
+  allowFallbackRetry = true,
+  hardTimeoutMs = null,
+  jobId = null,
+  jobEntry = null
 }) {
   // Permission-skipping mode (--dangerously-skip-permissions) is off by default and
   // explicitly refused when AGY_DENY_SKIP_PERMISSIONS=1 unless AGY_ALLOW_SKIP_PERMISSIONS=1 is set.
@@ -1534,6 +2144,7 @@ async function executeAgyWithGovernorUnqueued({
   const ledger = refreshQuotaState(readJsonSafe(STATE_LEDGER_PATH));
   const ideSync = readJsonSafe(IDE_SYNC_PATH);
   const wsEnv = ideSync.workspace_environment || {};
+  const hardMaxMs = getAgyRunMaxMs(hardTimeoutMs);
 
   const fallbackChain = matrix.fallback_chain || [
     'gemini-4-argon-high',
@@ -1596,23 +2207,47 @@ async function executeAgyWithGovernorUnqueued({
       args.push('-c');
     }
 
-    logStderr(`Spawning agy: model=${currentModel}, mode=${mode}, cwd=${cwd}`);
+    logStderr(
+      `Spawning agy: job=${jobId || 'adhoc'}, model=${currentModel}, mode=${mode}, cwd=${cwd}, watchdog=${hardMaxMs}ms`
+    );
 
     const attemptResult = await new Promise(resolve => {
       let stdoutBuf = '';
       let stderrBuf = '';
       let abortedFor429 = null;
+      let abortedForWatchdog = false;
       let finished = false;
 
-      const child = spawn(agyBin, args, {
+      const isJsScript = /\.m?js$/i.test(agyBin);
+      const spawnCmd = isJsScript ? process.execPath : agyBin;
+      const spawnArgs = isJsScript ? [agyBin, ...args] : args;
+
+      const child = spawn(spawnCmd, spawnArgs, {
         cwd,
         env: childEnv,
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe']
       });
 
+      if (jobEntry) {
+        jobEntry.child = child;
+        jobEntry.jobRecord.pid = child.pid || null;
+        jobEntry.jobRecord.log_file = logFilePath;
+        jobEntry.jobRecord.model = currentModel;
+        persistJobAndSessionState(jobEntry.jobRecord, 'running', jobEntry.provisionalSessionId);
+      }
+
+      const watchdogTimer = setTimeout(() => {
+        if (finished) return;
+        abortedForWatchdog = true;
+        logStderr(
+          `[WATCHDOG] agy job ${jobId || 'adhoc'} exceeded AGY_RUN_MAX_MS (${hardMaxMs}ms) on ${currentModel} (PID ${child.pid}). Terminating process tree...`
+        );
+        killProcessTree(child);
+      }, hardMaxMs);
+
       const checkLogFor429 = () => {
-        if (finished || abortedFor429) return;
+        if (finished || abortedFor429 || abortedForWatchdog || jobEntry?.cancelled) return;
         let logContent = '';
         try {
           if (fs.existsSync(logFilePath)) {
@@ -1645,12 +2280,16 @@ async function executeAgyWithGovernorUnqueued({
       child.on('error', err => {
         finished = true;
         clearInterval(pollTimer);
+        clearTimeout(watchdogTimer);
+        if (jobEntry) jobEntry.child = null;
         resolve({
           ok: false,
           exitCode: -1,
           stdout: stdoutBuf,
           stderr: `${stderrBuf}\n${err.message}`,
           abortedFor429,
+          abortedForWatchdog,
+          abortedForCancel: Boolean(jobEntry?.cancelled),
           logFilePath
         });
       });
@@ -1658,7 +2297,9 @@ async function executeAgyWithGovernorUnqueued({
       child.on('close', code => {
         finished = true;
         clearInterval(pollTimer);
-        if (!abortedFor429) {
+        clearTimeout(watchdogTimer);
+        if (jobEntry) jobEntry.child = null;
+        if (!abortedFor429 && !abortedForWatchdog && !jobEntry?.cancelled) {
           let logContent = '';
           try {
             if (fs.existsSync(logFilePath)) {
@@ -1668,15 +2309,75 @@ async function executeAgyWithGovernorUnqueued({
           abortedFor429 = detectQuotaExhaustion(`${stderrBuf}\n${stdoutBuf}\n${logContent}`);
         }
         resolve({
-          ok: code === 0 && !abortedFor429,
+          ok: code === 0 && !abortedFor429 && !abortedForWatchdog && !jobEntry?.cancelled,
           exitCode: code,
           stdout: stdoutBuf,
           stderr: stderrBuf,
           abortedFor429,
+          abortedForWatchdog,
+          abortedForCancel: Boolean(jobEntry?.cancelled),
           logFilePath
         });
       });
     });
+
+    // Requirement #4: Caller cancelled job via agy_cancel
+    if (attemptResult.abortedForCancel || jobEntry?.cancelled) {
+      const cancelMsg =
+        jobEntry?.cancelReason ||
+        `Job ${jobId || 'adhoc'} was cancelled by caller via agy_cancel.`;
+      return {
+        ok: false,
+        cancelled: true,
+        timedOut: false,
+        modelUsed: currentModel,
+        stepDownReason,
+        conversationId: conversationId || jobId || null,
+        responseText: '',
+        deniedActions: [],
+        responseEmpty: true,
+        governorAlerts: [],
+        logFilePath: fs.existsSync(attemptResult.logFilePath) ? attemptResult.logFilePath : null,
+        error: cancelMsg
+      };
+    }
+
+    // Requirement #3: Hard watchdog backstop killed a hung agy child — preserve log file on disk!
+    if (attemptResult.abortedForWatchdog) {
+      try {
+        if (!fs.existsSync(attemptResult.logFilePath)) {
+          const diagnosticLog = [
+            `[WATCHDOG TERMINATION] Job ${jobId || 'adhoc'} exceeded AGY_RUN_MAX_MS (${hardMaxMs}ms) on ${currentModel}.`,
+            attemptResult.stderr ? `[STDERR]\n${attemptResult.stderr}` : '',
+            attemptResult.stdout ? `[STDOUT]\n${attemptResult.stdout}` : ''
+          ]
+            .filter(Boolean)
+            .join('\n\n');
+          fs.writeFileSync(attemptResult.logFilePath, diagnosticLog, 'utf8');
+        }
+      } catch (_) {}
+
+      const watchdogErr = `Hard watchdog timeout: job ${
+        jobId || 'adhoc'
+      } exceeded AGY_RUN_MAX_MS (${hardMaxMs}ms / ${Math.round(
+        hardMaxMs / 1000
+      )}s) on ${currentModel} and was killed. Log preserved at: ${attemptResult.logFilePath}`;
+      return {
+        ok: false,
+        cancelled: false,
+        timedOut: true,
+        modelUsed: currentModel,
+        stepDownReason,
+        conversationId: conversationId || jobId || null,
+        responseText: '',
+        deniedActions: [],
+        responseEmpty: true,
+        governorAlerts: [],
+        logFilePath: attemptResult.logFilePath,
+        error: watchdogErr,
+        rawStderr: attemptResult.stderr
+      };
+    }
 
     try {
       if (fs.existsSync(attemptResult.logFilePath)) {
@@ -1781,7 +2482,7 @@ async function executeAgyWithGovernorUnqueued({
       estimated_tokens_used: 0,
       max_context_tokens: maxContextTokens,
       turns: 0,
-      created_at: new Date().toISOString(),
+      created_at: jobEntry?.jobRecord?.queued_at || new Date().toISOString(),
       last_updated_at: null,
       compacted_from: null
     };
@@ -1794,6 +2495,17 @@ async function executeAgyWithGovernorUnqueued({
       : existingSession.estimated_tokens_used + estimatedTokensTurn;
     existingSession.turns = (existingSession.turns || 0) + 1;
     existingSession.last_updated_at = new Date().toISOString();
+    if (jobEntry?.jobRecord) {
+      existingSession.job_id = jobEntry.jobRecord.job_id;
+      existingSession.state = attemptResult.ok && !responseEmpty ? 'done' : 'failed';
+      existingSession.tier = jobEntry.jobRecord.tier;
+      existingSession.mode = jobEntry.jobRecord.mode;
+      existingSession.prompt_preview = jobEntry.jobRecord.prompt_preview;
+      existingSession.started_at =
+        jobEntry.jobRecord.started_at || jobEntry.jobRecord.queued_at;
+      existingSession.finished_at = existingSession.last_updated_at;
+      existingSession.elapsed_s = computeLiveElapsedSeconds(jobEntry.jobRecord);
+    }
 
     updatedLedger.sessions[resolvedConvId] = existingSession;
     updatedLedger.active_session_id = resolvedConvId;
@@ -2101,12 +2813,12 @@ function validateDisjointSwarmPartitions(tasks) {
   return { valid: true };
 }
 
-// MCP Tool Definitions (Section 2E + Workspace Provisioner)
+// MCP Tool Definitions (Section 2E + Workspace Provisioner + Async Job Controls)
 const MCP_TOOLS = [
   {
     name: 'agy_delegate_research',
     description:
-      'Delegate deep read-only codebase research, cross-module architectural analysis, bug root-cause tracing, or security verification to Google Antigravity CLI (agy) using verified Gemini 3.8 Flash or Gemini 4 Argon models in --mode=plan. WHEN TO USE: Complex multi-file reasoning or architectural audits across 5–30+ files after initial scouting. DO NOT USE FOR: Simple signature, import, or line-number extraction on known files (use `local_file_scout` instead at 0x quota) or parallel disjoint directory scans (use `agy_spawn_swarm` instead). RETURNS: Markdown analysis with <file>:<line> citations and telemetry footer.',
+      'Delegate deep read-only codebase research, cross-module architectural analysis, bug root-cause tracing, or security verification to Google Antigravity CLI (agy) using verified Gemini 3.8 Flash or Gemini 4 Argon models in --mode=plan. SERIALIZATION & ASYNC BUDGET: Calls are serialized (one at a time, AGY_MAX_CONCURRENCY = 1); a prompt that needs more than ~8 minutes of agent time should be split into one bounded question per call, or launched expecting to fetch the result by job_id via `agy_job_result` (soft handoff at 540s, hard watchdog at AGY_RUN_MAX_MS, cancellable via `agy_cancel`). WHEN TO USE: Complex multi-file reasoning or architectural audits across 5–30+ files after initial scouting. DO NOT USE FOR: Simple signature, import, or line-number extraction on known files (use `local_file_scout` instead at 0x quota) or parallel disjoint directory scans (use `agy_spawn_swarm` instead). RETURNS: Markdown analysis with <file>:<line> citations (or an async `job_id` handle if still running at soft budget) and telemetry footer.',
     annotations: {
       title: 'Delegate Cloud Research (Gemini Flash/Argon)',
       readOnlyHint: true,
@@ -2122,7 +2834,7 @@ const MCP_TOOLS = [
           type: 'string',
           minLength: 1,
           description:
-            'Detailed research or analysis prompt for Antigravity. Name the specific files to inspect.'
+            'Detailed research or analysis prompt for Antigravity. Name the specific files to inspect. Keep to one bounded question (<~8 min agent time) or use agy_job_result if handed a job_id.'
         },
         tier: {
           type: 'string',
@@ -2152,6 +2864,13 @@ const MCP_TOOLS = [
           type: 'string',
           description:
             'Optional filename (e.g. "arch-overview.html") to instruct agy to write a self-contained visual HTML report.'
+        },
+        soft_timeout_ms: {
+          type: 'number',
+          minimum: 100,
+          maximum: 590000,
+          description:
+            'Optional soft budget in milliseconds before returning an async job_id handle (default 540000 = 540s, below the 600s client timeout).'
         }
       },
       required: ['prompt', 'tier']
@@ -2160,7 +2879,7 @@ const MCP_TOOLS = [
   {
     name: 'agy_spawn_swarm',
     description:
-      'Dispatch multiple read-only Antigravity subagents using gemini-3.8-flash-low or gemini-3.8-flash-medium across strictly disjoint directory partitions. WHEN TO USE: Exploring multiple independent subsystems or directories in a single turn. DO NOT USE FOR: Single-directory research (use `agy_delegate_research`), single-file signature extraction (use `local_file_scout`), or overlapping directory paths (rejected by partition validator). RETURNS: Aggregated markdown report per subagent task plus telemetry footer.',
+      'Dispatch multiple read-only Antigravity subagents using gemini-3.8-flash-low or gemini-3.8-flash-medium across strictly disjoint directory partitions. SERIALIZATION & ASYNC BUDGET: Tasks run sequentially one after another (one at a time, AGY_MAX_CONCURRENCY = 1) and share the same ~8-minute soft budget ceiling; keep each task prompt bounded or fetch any in-flight task result by job_id via `agy_job_result`. WHEN TO USE: Exploring multiple independent subsystems or directories in a single turn. DO NOT USE FOR: Single-directory research (use `agy_delegate_research`), single-file signature extraction (use `local_file_scout`), or overlapping directory paths (rejected by partition validator). RETURNS: Aggregated markdown report per subagent task (or async `job_id` handles for tasks still running at soft budget) plus telemetry footer.',
     annotations: {
       title: 'Spawn Disjoint-Path Subagent Swarm',
       readOnlyHint: true,
@@ -2175,7 +2894,7 @@ const MCP_TOOLS = [
         tasks: {
           type: 'array',
           minItems: 1,
-          description: 'Array of subagent tasks with strictly non-overlapping directory globs.',
+          description: 'Array of subagent tasks with strictly non-overlapping directory globs (dispatched sequentially one after another).',
           items: {
             type: 'object',
             additionalProperties: false,
@@ -2210,6 +2929,13 @@ const MCP_TOOLS = [
         cwd: {
           type: 'string',
           description: 'Optional workspace root directory path.'
+        },
+        soft_timeout_ms: {
+          type: 'number',
+          minimum: 100,
+          maximum: 590000,
+          description:
+            'Optional soft budget in milliseconds before returning async job_id handles for any remaining tasks (default 540000 = 540s).'
         }
       },
       required: ['tasks']
@@ -2218,7 +2944,7 @@ const MCP_TOOLS = [
   {
     name: 'agy_delegate_edit',
     description:
-      'Delegate complex multi-file code modifications or cross-module refactoring to Antigravity (agy) in --mode=accept-edits. WHEN TO USE: Coordinated edits across multiple existing files requiring Gemini Argon/Flash reasoning. DO NOT USE FOR: Generating a single standalone boilerplate, DTO, schema, or unit test file (use `local_draft_leaf_code` instead at 0x quota), read-only analysis (use `agy_delegate_research`), or running test suites (use `local_exec_and_triage`). RETURNS: Edit summary, optional IDE visual diff confirmation, and telemetry footer.',
+      'Delegate complex multi-file code modifications or cross-module refactoring to Antigravity (agy) in --mode=accept-edits. SERIALIZATION & ASYNC BUDGET: Calls are serialized (one at a time, AGY_MAX_CONCURRENCY = 1); split edits needing >~8 minutes into smaller scoped calls or fetch in-flight runs via `agy_job_result`. WHEN TO USE: Coordinated edits across multiple existing files requiring Gemini Argon/Flash reasoning. DO NOT USE FOR: Generating a single standalone boilerplate, DTO, schema, or unit test file (use `local_draft_leaf_code` instead at 0x quota), read-only analysis (use `agy_delegate_research`), or running test suites (use `local_exec_and_triage`). RETURNS: Edit summary, optional IDE visual diff confirmation, and telemetry footer.',
     annotations: {
       title: 'Delegate Multi-File Cloud Edit',
       readOnlyHint: false,
@@ -2263,6 +2989,13 @@ const MCP_TOOLS = [
         cwd: {
           type: 'string',
           description: 'Optional working directory path.'
+        },
+        soft_timeout_ms: {
+          type: 'number',
+          minimum: 100,
+          maximum: 590000,
+          description:
+            'Optional soft budget in milliseconds before returning an async job_id handle (default 540000 = 540s).'
         }
       },
       required: ['prompt']
@@ -2271,7 +3004,7 @@ const MCP_TOOLS = [
   {
     name: 'agy_session_followup',
     description:
-      'Resume an existing Antigravity conversation ID (--conversation <id>) so previously loaded files remain in context cache, automatically compacting the session if context usage exceeds 80%. WHEN TO USE: Multi-turn follow-up questions on an existing Session ID returned by a prior `agy_delegate_research` or `agy_delegate_edit` call. DO NOT USE FOR: Starting a brand-new research task without a prior session (use `agy_delegate_research` instead). RETURNS: Follow-up response, optional compaction notice, and updated session telemetry.',
+      'Resume an existing Antigravity conversation ID (--conversation <id>) so previously loaded files remain in context cache, automatically compacting the session if context usage exceeds 80%. SERIALIZATION & ASYNC BUDGET: Calls are serialized (one at a time, AGY_MAX_CONCURRENCY = 1); keep follow-ups to one bounded question (<~8 minutes) or fetch in-flight runs by job_id via `agy_job_result`. WHEN TO USE: Multi-turn follow-up questions on an existing Session ID returned by a prior `agy_delegate_research` or `agy_delegate_edit` call. DO NOT USE FOR: Starting a brand-new research task without a prior session (use `agy_delegate_research` instead). RETURNS: Follow-up response, optional compaction notice, and updated session telemetry.',
     annotations: {
       title: 'Follow Up on Cached Cloud Session',
       readOnlyHint: false,
@@ -2315,9 +3048,74 @@ const MCP_TOOLS = [
         cwd: {
           type: 'string',
           description: 'Optional working directory path.'
+        },
+        soft_timeout_ms: {
+          type: 'number',
+          minimum: 100,
+          maximum: 590000,
+          description:
+            'Optional soft budget in milliseconds before returning an async job_id handle (default 540000 = 540s).'
         }
       },
       required: ['conversation_id', 'prompt']
+    }
+  },
+  {
+    name: 'agy_job_result',
+    description:
+      'Fetch the stored output or live status of an Antigravity job by `job_id` (or `"latest"`). WHEN TO USE: Retrieving the result of a long-running `agy_delegate_research`, `agy_spawn_swarm`, `agy_delegate_edit`, or `agy_session_followup` call that returned `"still running, job <id>..."` after reaching the soft budget (default 540s). DO NOT USE FOR: Starting a new research or edit task. RETURNS: The full completed subagent response and session telemetry if finished (`done` / `failed` / `cancelled` / `timed_out`), or `"still running, job <id>, started <time>, elapsed <s>s; fetch with agy_job_result <id>"` if still in flight.',
+    annotations: {
+      title: 'Fetch Async Cloud Job Result',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false
+    },
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        job_id: {
+          type: 'string',
+          minLength: 1,
+          description:
+            'The job_id returned when a run exceeded the soft timeout (or listed in agy_status.agy_process_queue), or "latest" for the most recent job.'
+        },
+        wait_ms: {
+          type: 'number',
+          minimum: 0,
+          maximum: 540000,
+          default: 0,
+          description:
+            'Optional milliseconds to wait for completion if the job is still running (default 0 for instant check; max 540000).'
+        }
+      },
+      required: ['job_id']
+    }
+  },
+  {
+    name: 'agy_cancel',
+    description:
+      'Cancel a currently running or queued Antigravity job by `job_id` (or `"active"`), terminating any hung or unneeded child process tree (`taskkill /T /F`) and freeing the serialized `agy` queue immediately. WHEN TO USE: Aborting an in-flight or queued `agy` job shown in `agy_status` so subsequent calls are not blocked. DO NOT USE FOR: Read-only status checks (use `agy_status` or `agy_job_result`). RETURNS: JSON cancellation report `{ ok, job_id, previous_state, state, pid, elapsed_s, message }` plus telemetry footer.',
+    annotations: {
+      title: 'Cancel Running or Queued Cloud Job',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false
+    },
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        job_id: {
+          type: 'string',
+          minLength: 1,
+          description:
+            'The job_id to cancel (e.g. "job-1730250000000-a1b2c3"), or "active" / "current" to cancel the currently running job.'
+        }
+      },
+      required: ['job_id']
     }
   },
   {
@@ -2398,7 +3196,7 @@ const MCP_TOOLS = [
   {
     name: 'agy_status',
     description:
-      'Inspect current system health, Gemini 5-hour/weekly quota windows, Local GPU VRAM availability (`/api/ps`), process queue state, active session context remaining, and Git worktree pre-flight status in read-only mode. WHEN TO USE: Checking whether the Local GPU worker or Gemini Argon/Flash tiers are online and inspecting token savings. DO NOT USE FOR: Modifying workspace settings or attaching the IDE (use `agy_configure_workspace` instead). RETURNS: JSON status report `{ agy_process_queue, local_gpu_queue, local_gpu_probe, local_gpu_telemetry, model_quotas, sessions }` plus telemetry footer.',
+      'Inspect current system health, Gemini 5-hour/weekly quota windows, Local GPU VRAM availability (`/api/ps`), process queue state (`active_job`, `waiting_jobs`, `recent_jobs` with `job_id`, `state`, `started_at`, `elapsed_s`, `tier`, `prompt_preview`), active session context remaining, and Git worktree pre-flight status in read-only mode. WHEN TO USE: Checking whether the Local GPU worker or Gemini Argon/Flash tiers are online, inspecting in-flight/queued jobs, and checking token savings. DO NOT USE FOR: Modifying workspace settings or attaching the IDE (use `agy_configure_workspace` instead). RETURNS: JSON status report `{ agy_process_queue, local_gpu_queue, local_gpu_probe, local_gpu_telemetry, model_quotas, sessions }` plus telemetry footer.',
     annotations: {
       title: 'Get Hybrid Router & Quota Status',
       readOnlyHint: true,
@@ -2561,11 +3359,21 @@ async function handleToolCall(name, args = {}) {
     const gitCheck = checkAndFixGitWorktreeConfig(cwd, false);
     const autoDetectedEnv = detectWorkspaceEnvironment(cwd);
 
+    // Refresh live elapsed_s on any running/queued sessions in the status snapshot
+    const liveSessions = {};
+    for (const [sid, sess] of Object.entries(ledger.sessions || {})) {
+      const copy = { ...sess };
+      if (copy.state === 'running' || copy.state === 'queued') {
+        copy.elapsed_s = computeLiveElapsedSeconds(copy);
+      }
+      liveSessions[sid] = copy;
+    }
+
     const statusReport = {
       agy_binary: resolveAgyBinary(),
       ide_binary: resolveIdeBinary(ideSync),
       workspace_root: WORKSPACE_ROOT,
-      agy_process_queue: { ...agyQueueState },
+      agy_process_queue: getAgyQueueSnapshot(),
       local_gpu_queue: { ...localGpuQueueState },
       local_gpu_config: getLocalGpuConfig(matrix),
       local_gpu_probe: await probeAndResolveLocalGpu(getLocalGpuConfig(matrix)),
@@ -2582,8 +3390,8 @@ async function handleToolCall(name, args = {}) {
       last_discovery_check: matrix.last_discovery_check,
       live_discovery_result: discoveryResult,
       active_session_id: ledger.active_session_id,
-      active_sessions_count: Object.keys(ledger.sessions || {}).length,
-      sessions: ledger.sessions,
+      active_sessions_count: Object.keys(liveSessions).length,
+      sessions: liveSessions,
       model_quotas: ledger.model_quotas,
       ide_hud_sync: ideSync
     };
@@ -2596,6 +3404,77 @@ async function handleToolCall(name, args = {}) {
       )}\n\`\`\`` + buildTelemetryFooter(null, ledger.active_session_id);
 
     return { content: [{ type: 'text', text }] };
+  }
+
+  if (name === 'agy_job_result') {
+    const jobIdArg = String(args.job_id || '').trim();
+    const waitMs =
+      typeof args.wait_ms === 'number' && args.wait_ms > 0 ? args.wait_ms : 0;
+    const jobRes = await getAgyJobResult(jobIdArg, waitMs);
+
+    if (!jobRes.found) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: 'text',
+            text: `Error: ${jobRes.message}${buildTelemetryFooter()}`
+          }
+        ]
+      };
+    }
+
+    const jr = jobRes.jobRecord;
+    if (jobRes.stillRunning) {
+      const pendingText =
+        formatAsyncPendingMessage(jr, null) +
+        buildTelemetryFooter(jr.model, jr.conversation_id);
+      return {
+        isError: false,
+        content: [{ type: 'text', text: pendingText }]
+      };
+    }
+
+    const stored = jobRes.result || {};
+    const header = [
+      `### Async Job Result: \`${jr.job_id}\``,
+      `- **State:** \`${jr.state}\` | **Tier / Model:** \`${jr.tier}\` (\`${
+        stored.modelUsed || jr.model
+      }\`) | **Elapsed:** \`${jr.elapsed_s}s\` | **Session:** \`${
+        stored.conversationId || jr.conversation_id
+      }\``,
+      jr.log_file ? `- **Log File:** \`${jr.log_file}\`` : '',
+      ''
+    ]
+      .filter(line => line !== '')
+      .join('\n');
+
+    const body = `${formatGovernorNotices(stored)}${stored.responseText || ''}`;
+    const text =
+      `${header}\n\n${body}` +
+      buildTelemetryFooter(
+        stored.modelUsed || jr.model,
+        stored.conversationId || jr.conversation_id
+      );
+
+    return {
+      isError: !stored.ok,
+      content: [{ type: 'text', text }]
+    };
+  }
+
+  if (name === 'agy_cancel') {
+    const cancelRes = await cancelAgyJob(args.job_id);
+    const text =
+      `### Antigravity Job Cancellation\n\`\`\`json\n${JSON.stringify(
+        cancelRes,
+        null,
+        2
+      )}\n\`\`\`` + buildTelemetryFooter();
+    return {
+      isError: !cancelRes.ok,
+      content: [{ type: 'text', text }]
+    };
   }
 
   if (name === 'agy_delegate_research') {
@@ -2617,14 +3496,17 @@ async function handleToolCall(name, args = {}) {
 
     const res = await executeAgyWithGovernor({
       prompt: fullPrompt,
+      rawPrompt: args.prompt,
       requestedModel: args.tier || 'flash-medium',
       mode: 'plan',
-      cwd
+      cwd,
+      softTimeoutMs: args.soft_timeout_ms,
+      onComplete: () => {
+        if (args.files_to_follow?.length) {
+          triggerVisualHudFollowFiles('', cwd, args.files_to_follow);
+        }
+      }
     });
-
-    if (args.files_to_follow?.length) {
-      triggerVisualHudFollowFiles('', cwd, args.files_to_follow);
-    }
 
     const text =
       `${formatGovernorNotices(res)}${res.responseText || ''}` +
@@ -2681,17 +3563,21 @@ async function handleToolCall(name, args = {}) {
       // concurrent agy processes interfere, so the "swarm" is dispatched one at a time.
       const res = await executeAgyWithGovernor({
         prompt: partitionedPrompt,
+        rawPrompt: task.prompt,
         requestedModel: tier,
         mode: 'plan',
-        cwd
+        cwd,
+        softTimeoutMs: args.soft_timeout_ms
       });
 
       return {
         taskId: task.id,
+        jobId: res.jobId,
         paths: task.paths,
         modelUsed: res.modelUsed,
         conversationId: res.conversationId,
         ok: res.ok,
+        asyncPending: Boolean(res.asyncPending),
         notices: formatGovernorNotices(res),
         response: res.responseText || '',
         tokens: res.usage?.total_tokens || res.session?.estimated_tokens_used || 0
@@ -2702,9 +3588,11 @@ async function handleToolCall(name, args = {}) {
     const formatted = results
       .map(
         r =>
-          `### Subagent \`${r.taskId}\` (Paths: \`${r.paths.join(', ')}\` | Model: \`${
-            r.modelUsed
-          }\` | Session: \`${r.conversationId}\` | ${r.ok ? 'OK' : 'FAILED'})\n${r.notices}${r.response}`
+          `### Subagent \`${r.taskId}\` (Job: \`${r.jobId}\` | Paths: \`${r.paths.join(
+            ', '
+          )}\` | Model: \`${r.modelUsed}\` | Session: \`${r.conversationId}\` | ${
+            r.asyncPending ? 'RUNNING_ASYNC' : r.ok ? 'OK' : 'FAILED'
+          })\n${r.notices}${r.response}`
       )
       .join('\n\n---\n\n');
 
@@ -2744,35 +3632,38 @@ async function handleToolCall(name, args = {}) {
     }
 
     const execMode = args.allow_shell ? 'dangerously-skip-permissions' : 'accept-edits';
+    let diffBanner = '';
     const res = await executeAgyWithGovernor({
       prompt: args.prompt,
+      rawPrompt: args.prompt,
       requestedModel: args.tier || 'argon-medium',
       mode: execMode,
-      cwd
+      cwd,
+      softTimeoutMs: args.soft_timeout_ms,
+      onComplete: completedRes => {
+        const diffsOpened = [];
+        for (const [absPath, snapPath] of Object.entries(snapshots)) {
+          try {
+            if (fs.existsSync(absPath) && fs.existsSync(snapPath)) {
+              const beforeContent = fs.readFileSync(snapPath, 'utf8');
+              const afterContent = fs.readFileSync(absPath, 'utf8');
+              if (beforeContent !== afterContent) {
+                if (triggerVisualDiffReview(snapPath, absPath, cwd)) {
+                  diffsOpened.push(path.relative(cwd, absPath));
+                }
+              }
+            }
+          } catch (_) {}
+        }
+        if (diffsOpened.length > 0) {
+          diffBanner = `\n\n> [IDE Visual Review Gate: Opened inline diff review for: ${diffsOpened.join(', ')}]`;
+          completedRes.responseText = `${completedRes.responseText || ''}${diffBanner}`;
+        }
+      }
     });
 
-    const diffsOpened = [];
-    for (const [absPath, snapPath] of Object.entries(snapshots)) {
-      try {
-        if (fs.existsSync(absPath) && fs.existsSync(snapPath)) {
-          const beforeContent = fs.readFileSync(snapPath, 'utf8');
-          const afterContent = fs.readFileSync(absPath, 'utf8');
-          if (beforeContent !== afterContent) {
-            if (triggerVisualDiffReview(snapPath, absPath, cwd)) {
-              diffsOpened.push(path.relative(cwd, absPath));
-            }
-          }
-        }
-      } catch (_) {}
-    }
-
-    const diffBanner =
-      diffsOpened.length > 0
-        ? `\n\n> [IDE Visual Review Gate: Opened inline diff review for: ${diffsOpened.join(', ')}]`
-        : '';
-
     const text =
-      `${formatGovernorNotices(res)}${res.responseText || ''}${diffBanner}` +
+      `${formatGovernorNotices(res)}${res.responseText || ''}` +
       buildTelemetryFooter(res.modelUsed, res.conversationId);
 
     return {
@@ -2804,11 +3695,13 @@ async function handleToolCall(name, args = {}) {
 
     const res = await executeAgyWithGovernor({
       prompt: withShellRules(effectivePrompt),
+      rawPrompt: args.prompt,
       requestedModel,
       mode: args.mode || 'plan',
       conversationId: effectiveConvId,
       continueLatest: isLatest && !effectiveConvId,
-      cwd
+      cwd,
+      softTimeoutMs: args.soft_timeout_ms
     });
 
     const text =
@@ -3389,12 +4282,13 @@ const MARKER_START = '<!-- AGY-SUBAGENT-GOVERNOR:START -->';
 const MARKER_END = '<!-- AGY-SUBAGENT-GOVERNOR:END -->';
 
 // Read-only tools that are safe to pre-approve when --bootstrap is explicitly run.
-// Write/shell tools (agy_delegate_edit, agy_configure_workspace, local_exec_and_triage,
+// Write/shell tools (agy_delegate_edit, agy_cancel, agy_configure_workspace, local_exec_and_triage,
 // local_draft_leaf_code) are never pre-approved unless --approve-all is explicitly passed.
 const SAFE_READONLY_MCP_TOOLS = Object.freeze([
   'agy_status',
   'agy_delegate_research',
   'agy_spawn_swarm',
+  'agy_job_result',
   'local_file_scout'
 ]);
 
@@ -3417,13 +4311,16 @@ const MCP_SERVER_INSTRUCTIONS = [
   '   - `local_file_scout(file_paths, query)`: Forensic disk-evidence extractor. Use before raw `Read` on large/unfamiliar files (>150 lines) to extract verbatim `<file>:L<line>` signatures and imports (<300 tokens), or `"NOT_FOUND_ON_DISK: [symbol/query]"` if absent. Automatically escalates to `gemini-3.8-flash-low` if the local GPU endpoint is offline.',
   '   - `local_exec_and_triage(command, working_dir)`: Use to run and scrub verbose test/build output (>40 lines) (`pytest`, `npm test`, `tsc`, `cargo check`). Returns logs <=40 lines directly; scrubs logs >40 lines via the Local GPU (or `flash-low` fallback).',
   '   - `local_draft_leaf_code(target_file, spec, reference_files)`: Use to draft boilerplate/tests to disk with an empty/truncation overwrite guard, then inspect `git diff`.',
-  '3. Cloud Gemini Tiers (`agy_delegate_research`, `agy_spawn_swarm`, `agy_delegate_edit`, `agy_session_followup`):',
+  '3. Cloud Gemini Tiers (`agy_delegate_research`, `agy_spawn_swarm`, `agy_delegate_edit`, `agy_session_followup`, `agy_job_result`, `agy_cancel`):',
   '   - `flash-low` / `flash-medium` (1x burn): Wide repo triage, log scanning, disjoint-path swarms (`agy_spawn_swarm`).',
   '   - `flash-high` (2x burn): Multi-file module summaries, routine test generation, second-opinion verification.',
   '   - `argon-low` / `argon-medium` (4x burn): Cross-module tracing, subtle bug investigation, scoped multi-file edits.',
   '   - `argon-high` (6x burn): Deep architectural design, security/race-condition audits across 30+ files.',
-  '4. Headless `agy` Shell Rules: Headless `agy -p` only permits exact allow-listed read-only git commands (one command per tool call, never chained). Name the files for `agy` to read rather than asking it to run `grep`/`find`.',
-  '5. Optional Workspace Setup: `agy_configure_workspace` is optional and only needed if you want to attach the Antigravity IDE Visual HUD or configure custom `.venv`/monorepo paths.'
+  '4. Serialization, Async Job Mode & Watchdog (`AGY_MAX_CONCURRENCY = 1`):',
+  '   - Calls to `agy` are serialized (one at a time, including `agy_spawn_swarm` tasks). A prompt needing more than ~8 minutes of agent time should be split into one bounded question per call, or launched expecting to fetch the result by `job_id` via `agy_job_result`.',
+  '   - If a run exceeds the soft budget (`AGY_SOFT_TIMEOUT_MS`, default 540s, below the 600s client timeout), the tool returns `"still running, job <id>, started <time>, elapsed <s>s; fetch with agy_job_result <id>"` while the child keeps running in the background. Use `agy_job_result(job_id)` to fetch the completed answer or `agy_cancel(job_id)` to abort and free the queue. A hard watchdog (`AGY_RUN_MAX_MS`, default 1800s) kills genuinely hung processes and preserves the log path.',
+  '5. Headless `agy` Shell Rules: Headless `agy -p` only permits exact allow-listed read-only git commands (one command per tool call, never chained). Name the files for `agy` to read rather than asking it to run `grep`/`find`.',
+  '6. Optional Workspace Setup: `agy_configure_workspace` is optional and only needed if you want to attach the Antigravity IDE Visual HUD or configure custom `.venv`/monorepo paths.'
 ].join('\n');
 
 const CLAUDE_MD_GOVERNOR_BLOCK = `${MARKER_START}
@@ -3439,7 +4336,7 @@ Because \`agy-subagent\` is a \`stdio\` MCP server registered in \`.mcp.json\`, 
   \`\`\`bash
   node .agy-subagent/server/index.js --bootstrap
   \`\`\`
-  By default, \`--bootstrap\` merges \`agy-subagent\` into \`.mcp.json\`, enables only \`agy-subagent\` in \`.claude/settings.local.json\` (pre-approving only the 4 read-only tools: \`agy_status\`, \`agy_delegate_research\`, \`agy_spawn_swarm\`, \`local_file_scout\`), and does **not** create or modify \`CLAUDE.md\` or \`AGENTS.md\` unless \`--write-docs\` is explicitly passed.
+  By default, \`--bootstrap\` merges \`agy-subagent\` into \`.mcp.json\`, enables only \`agy-subagent\` in \`.claude/settings.local.json\` (pre-approving only the 5 read-only tools: \`agy_status\`, \`agy_delegate_research\`, \`agy_spawn_swarm\`, \`agy_job_result\`, \`local_file_scout\`), and does **not** create or modify \`CLAUDE.md\` or \`AGENTS.md\` unless \`--write-docs\` is explicitly passed.
 * **Immediate Direct CLI Execution (Zero Restart Required):** You can invoke any Governor tool directly via Bash:
   \`\`\`bash
   node .agy-subagent/server/index.js --cli agy_status "{\\"refresh_models\\":true}"
@@ -3483,9 +4380,11 @@ Before calling Claude's raw \`Read\` on large/unfamiliar files, running noisy te
 4. **\`agy_spawn_swarm\`**: Dispatch \`gemini-3.8-flash-low\` / \`gemini-3.8-flash-medium\` subagents across **strictly disjoint directory partitions** (\`paths: ["src/auth/**"]\` vs \`paths: ["src/db/**"]\`). Partitions are validated, then tasks run **one at a time** (agy processes are serialized).
 5. **\`agy_delegate_edit\`**: Delegate scoped file edits (\`allow_shell: false\` -> \`--mode=accept-edits\`). Note: \`allow_shell: true\` (\`--dangerously-skip-permissions\`) is disabled by default unless \`AGY_ALLOW_SKIP_PERMISSIONS=1\` is set.
 6. **\`agy_session_followup\`**: Resume an existing \`conversation_id\` (or \`"latest"\`) so previously loaded files stay in \`agy\`'s context cache (auto-compacts at 80% context usage).
-7. **\`local_file_scout\`**: Server-side disk reader + Local GPU signature/line-number extractor (skips binary/secret files, 50-50 head/tail slices >80K chars, \`max_tokens: 600\`).
-8. **\`local_exec_and_triage\`**: Server-side subprocess runner + Local GPU log scrubber for noisy test/build commands (>40 lines scrubbed, Windows \`taskkill /T /F\` tree-kill on timeout).
-9. **\`local_draft_leaf_code\`**: Server-side leaf boilerplate/test generator writing directly to \`target_file\` with empty/truncation overwrite guard and \`git diff --stat\` output.
+7. **\`agy_job_result\`**: Fetch the stored answer or live elapsed status of an async job by \`job_id\` (or \`"latest"\`) when a long run exceeds the 540s soft budget.
+8. **\`agy_cancel\`**: Terminate an in-flight or queued \`agy\` job by \`job_id\` (or \`"active"\`) and free the serialized queue immediately.
+9. **\`local_file_scout\`**: Server-side disk reader + Local GPU signature/line-number extractor (skips binary/secret files, 50-50 head/tail slices >80K chars, \`max_tokens: 600\`).
+10. **\`local_exec_and_triage\`**: Server-side subprocess runner + Local GPU log scrubber for noisy test/build commands (>40 lines scrubbed, Windows \`taskkill /T /F\` tree-kill on timeout).
+11. **\`local_draft_leaf_code\`**: Server-side leaf boilerplate/test generator writing directly to \`target_file\` with empty/truncation overwrite guard and \`git diff --stat\` output.
 
 ### 3. Headless Permission Behavior (Read Before Delegating)
 
@@ -3872,6 +4771,8 @@ module.exports = {
   AGY_READONLY_COMMAND_VOCABULARY,
   AGY_READONLY_COMMAND_ALLOWLIST,
   AGY_MAX_CONCURRENCY,
+  DEFAULT_AGY_SOFT_TIMEOUT_MS,
+  DEFAULT_AGY_RUN_MAX_MS,
   LOCAL_GPU_MAX_CONCURRENCY,
   SAFE_READONLY_MCP_TOOLS,
   SCOUT_SYSTEM_PROMPT,
@@ -3887,6 +4788,10 @@ module.exports = {
   runSelfHealingBootstrap,
   checkAndFixGitWorktreeConfig,
   executeAgyWithGovernor,
+  getAgyQueueSnapshot,
+  getAgyJobResult,
+  cancelAgyJob,
+  extractPromptPreview,
   validateDisjointSwarmPartitions,
   getLocalGpuConfig,
   probeAndResolveLocalGpu,

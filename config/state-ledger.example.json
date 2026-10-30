@@ -3,6 +3,7 @@
   "active_session_id": null,
   "context_compaction_threshold": 0.8,
   "sessions": {},
+  "jobs": {},
   "local_gpu_telemetry": {
     "total_requests": 0,
     "successful_local_requests": 0,

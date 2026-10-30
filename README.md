@@ -82,24 +82,27 @@ Running a local LLM on a multipurpose workstation requires strict hardware safeg
 
 ### E. Non-Invasive Security & Least-Privilege Defaults
 * **Zero Side Effects on `stdio` Startup:** Starting the MCP server never modifies `CLAUDE.md`, `AGENTS.md`, `.git/config`, or `.claude/settings.local.json`.
-* **Least-Privilege Bootstrap:** Running `--bootstrap` never sets `enableAllProjectMcpServers: true` and pre-approves only the 4 read-only tools (`agy_status`, `agy_delegate_research`, `agy_spawn_swarm`, `local_file_scout`).
+* **Least-Privilege Bootstrap:** Running `--bootstrap` never sets `enableAllProjectMcpServers: true` and pre-approves only the 5 read-only tools (`agy_status`, `agy_delegate_research`, `agy_spawn_swarm`, `agy_job_result`, `local_file_scout`).
 * **Safe Triage Command Allowlist:** `local_exec_and_triage` blocks shell chaining operators (`&&`, `;`, `|`) and restricts execution to allow-listed test, typecheck, and lint runners.
+* **Async Job Handoff & Hard Watchdog (`AGY_SOFT_TIMEOUT_MS` / `AGY_RUN_MAX_MS`):** Every `agy` run is assigned a `job_id` and registered in `sessions` and `agy_process_queue` at launch (`state: "running"`, `started_at`, `elapsed_s`, `tier`, `prompt_preview`). If a run exceeds the soft budget (`AGY_SOFT_TIMEOUT_MS`, default `540000` = 540s, below the 600s MCP client timeout), the tool returns a normal non-error response (`still running, job <id>...; fetch with agy_job_result <id>`) while the child continues in the background, preventing dropped stdio connections. A hard watchdog (`AGY_RUN_MAX_MS`, default `1800000` = 30m) terminates genuinely hung processes and preserves the log path, and `agy_cancel` lets callers abort any in-flight or queued job on demand.
 
 ---
 
-## 4. Exposed MCP Tools (9 Tools)
+## 4. Exposed MCP Tools (11 Tools)
 
 | Tool Name | Tier | Quota Burn | Purpose |
 | :--- | :--- | :---: | :--- |
 | `local_file_scout` | Tier 3 (Local GPU -> Flash Fallback) | **0x** | Forensic `<file>:L<line>` signature & import extractor (`<300 tokens`). |
 | `local_exec_and_triage` | Tier 3 (Local GPU -> Flash Fallback) | **0x** | Runs allow-listed test/build commands; returns `<=40` lines directly or scrubs `>40` lines on GPU. |
 | `local_draft_leaf_code` | Tier 3 (Local GPU -> Flash Fallback) | **0x** | Drafts boilerplate/unit tests to disk with truncation guard + `git diff --stat`. |
-| `agy_delegate_research` | Tier 1/2 (Gemini Flash / Argon) | **1x–6x** | Read-only codebase investigation (`--mode=plan`) with headless git allow-list rules. |
-| `agy_spawn_swarm` | Tier 1 (Gemini Flash Low/Med) | **1x/task** | Disjoint-directory subagent swarm with path-collision validation. |
+| `agy_delegate_research` | Tier 1/2 (Gemini Flash / Argon) | **1x–6x** | Read-only codebase investigation (`--mode=plan`) with headless git allow-list rules & 540s soft async handoff. |
+| `agy_spawn_swarm` | Tier 1 (Gemini Flash Low/Med) | **1x/task** | Disjoint-directory subagent swarm (serialized sequentially) with path-collision validation. |
 | `agy_delegate_edit` | Tier 2 (Gemini Argon / Flash) | **2x–6x** | Scoped multi-file modifications (`--mode=accept-edits`) with optional IDE `--diff` review. |
 | `agy_session_followup` | Tier 1/2 (Session Resume) | **1x–6x** | Resumes cached `conversation_id` and auto-compacts at 80% context usage. |
+| `agy_job_result` | Utility (Async Job Fetch) | **0x** | Retrieves the stored answer or live elapsed status of an async `job_id` (or `"latest"`). |
+| `agy_cancel` | Utility (Queue Control) | **0x** | Cancels a running or queued `job_id` (or `"active"`), killing the child process tree and freeing the queue. |
 | `agy_configure_workspace` | Utility | **0x** | Auto-detects `.venv` / `node_modules/.bin` and configures optional Antigravity IDE HUD sync. |
-| `agy_status` | Utility | **0x** | Reports live GPU VRAM probe, cloud quota timers, queue state, and model discovery. |
+| `agy_status` | Utility | **0x** | Reports live GPU VRAM probe, cloud quota timers, active/waiting jobs (`agy_process_queue`), and sessions. |
 
 ---
 
